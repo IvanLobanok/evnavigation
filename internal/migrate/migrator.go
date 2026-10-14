@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5" // Обрати внимание: это драйвер для pgx/v5
+	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 

@@ -1,4 +1,4 @@
-module evnavigation
+module github.com/IvanLobanok/evnavigation
 
 go 1.26.8
 

@@ -2,11 +2,12 @@ package postgres
 
 import (
 	"context"
-	"evnavigation/internal/domain"
 	"fmt"
+
+	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
 )
 
-func (r *Repository) GetEVModels(ctx context.Context) ([]domain.EVModel, error) {
+func (r *Repository) GetAllEVModels(ctx context.Context) ([]evmodel.EVModel, error) {
 	query :=
 		`SELECT 
 				id, 
@@ -25,10 +26,10 @@ func (r *Repository) GetEVModels(ctx context.Context) ([]domain.EVModel, error) 
 	}
 	defer rows.Close()
 
-	var models []domain.EVModel
+	var models []evmodel.EVModel
 
 	for rows.Next() {
-		var m domain.EVModel
+		var m evmodel.EVModel
 		if err := rows.Scan(
 			&m.ID,
 			&m.Brand,
@@ -47,4 +48,25 @@ func (r *Repository) GetEVModels(ctx context.Context) ([]domain.EVModel, error) 
 		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
 	return models, nil
+}
+
+func (r *Repository) GetEVModelByID(ctx context.Context, id int) (*evmodel.EVModel, error) {
+	query :=
+		`SELECT 
+				id, 
+				brand, 
+				model,
+				battery_capacity_kwh, 
+				avg_consumption_kwh_100km, 
+				connector_type, 
+				max_charging_power_kw 
+		FROM ev_models 
+		WHERE id = $1`
+
+	var model evmodel.EVModel
+	err := r.db.QueryRow(ctx, query, id).Scan(&model.ID, &model.Brand, &model.BatteryCapacityKwh, &model.AvgConsumptionKwh100km, &model.ConnectorType, &model.MaxChargingPowerKw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query EVModel: %w", err)
+	}
+	return &model, nil
 }

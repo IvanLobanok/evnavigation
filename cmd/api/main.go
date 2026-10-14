@@ -2,15 +2,13 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strings"
 	"time"
 
-	"evnavigation/internal/config"
-	"evnavigation/internal/domain"
-	"evnavigation/internal/migrate"
-	"evnavigation/internal/repository/postgres"
+	"github.com/IvanLobanok/evnavigation/internal/config"
+	"github.com/IvanLobanok/evnavigation/internal/migrate"
+	"github.com/IvanLobanok/evnavigation/internal/repository/postgres"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -44,8 +42,4 @@ func main() {
 
 	log.Printf("evnavigation backend initialized, server port configured: %s", cfg.ServerPort)
 
-	a := make([]domain.EVModel, 0)
-
-	a, _ = repo.GetEVModels(ctx)
-	fmt.Println(a)
 }

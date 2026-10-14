@@ -1,15 +1,17 @@
-package domain
+package route
 
 import (
 	"context"
 )
 
 type RoutePoint struct {
-	Lat, Lon float64
+	Lat float64
+	Lon float64
 }
 
 type RouteSegment struct {
-	From, To       RoutePoint
+	From           RoutePoint
+	To             RoutePoint
 	DistanceMeters float64
 }
 

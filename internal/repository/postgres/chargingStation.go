@@ -2,11 +2,12 @@ package postgres
 
 import (
 	"context"
-	"evnavigation/internal/domain"
 	"fmt"
+
+	"github.com/IvanLobanok/evnavigation/internal/models/station"
 )
 
-func (r *Repository) FindNearByStations(ctx context.Context, lat, lon float64, radiusMeters float64) ([]domain.ChargingStation, error) {
+func (r *Repository) FindNearByStations(ctx context.Context, lat, lon float64, radiusMeters float64) ([]station.ChargingStation, error) {
 	query := `
     SELECT
 			id,
@@ -25,10 +26,10 @@ func (r *Repository) FindNearByStations(ctx context.Context, lat, lon float64, r
 	}
 	defer rows.Close()
 
-	var stations []domain.ChargingStation
+	var stations []station.ChargingStation
 
 	for rows.Next() {
-		var s domain.ChargingStation
+		var s station.ChargingStation
 		if err := rows.Scan(
 			&s.ID,
 			&s.Name,

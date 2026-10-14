@@ -2,13 +2,14 @@ package station
 
 import (
 	"context"
-	"evnavigation/internal/domain"
 	"fmt"
 	"slices"
+
+	"github.com/IvanLobanok/evnavigation/internal/models/station"
 )
 
 type Repository interface {
-	FindNearByStations(ctx context.Context, lat, lon, radiusMeters float64) ([]domain.ChargingStation, error)
+	FindNearbyStations(ctx context.Context, lat, lon, radiusMeters float64) ([]station.ChargingStation, error)
 }
 
 type Service struct {
@@ -19,8 +20,8 @@ func NewService(repo Repository) *Service {
 	return &Service{repo: repo}
 }
 
-func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]domain.ChargingStation, error) {
-	stations, err := s.repo.FindNearByStations(ctx, lat, lon, radiusMeters)
+func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error) {
+	stations, err := s.repo.FindNearbyStations(ctx, lat, lon, radiusMeters)
 	if err != nil {
 		return nil, fmt.Errorf("station service error: %w", err)
 	}
@@ -29,7 +30,7 @@ func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radi
 		return stations, nil
 	}
 
-	var filtered []domain.ChargingStation
+	var filtered []station.ChargingStation
 	for _, station := range stations {
 		if hasCommonConnector(preferredConnectors, station.ConnectorTypes) {
 			filtered = append(filtered, station)
