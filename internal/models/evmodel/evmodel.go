@@ -1,5 +1,9 @@
 package evmodel
 
+import "errors"
+
+var ErrNotFound = errors.New("ev model not found")
+
 type EVModel struct {
 	ID                     int
 	Brand                  string

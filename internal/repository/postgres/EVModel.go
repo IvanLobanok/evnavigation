@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
+	"github.com/jackc/pgx/v5"
 )
 
 func (r *Repository) GetAllEVModels(ctx context.Context) ([]evmodel.EVModel, error) {
@@ -64,8 +66,11 @@ func (r *Repository) GetEVModelByID(ctx context.Context, id int) (*evmodel.EVMod
 		WHERE id = $1`
 
 	var model evmodel.EVModel
-	err := r.db.QueryRow(ctx, query, id).Scan(&model.ID, &model.Brand, &model.BatteryCapacityKwh, &model.AvgConsumptionKwh100km, &model.ConnectorType, &model.MaxChargingPowerKw)
+	err := r.db.QueryRow(ctx, query, id).Scan(&model.ID, &model.Brand, &model.Model, &model.BatteryCapacityKwh, &model.AvgConsumptionKwh100km, &model.ConnectorType, &model.MaxChargingPowerKw)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, evmodel.ErrNotFound
+		}
 		return nil, fmt.Errorf("failed to query EVModel: %w", err)
 	}
 	return &model, nil

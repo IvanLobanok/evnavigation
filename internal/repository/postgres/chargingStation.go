@@ -7,7 +7,7 @@ import (
 	"github.com/IvanLobanok/evnavigation/internal/models/station"
 )
 
-func (r *Repository) FindNearByStations(ctx context.Context, lat, lon float64, radiusMeters float64) ([]station.ChargingStation, error) {
+func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon float64, radiusMeters float64) ([]station.ChargingStation, error) {
 	query := `
     SELECT
 			id,
@@ -42,6 +42,10 @@ func (r *Repository) FindNearByStations(ctx context.Context, lat, lon float64, r
 			return nil, fmt.Errorf("failed to scan station: %w", err)
 		}
 		stations = append(stations, s)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
 
 	return stations, nil

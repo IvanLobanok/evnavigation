@@ -47,6 +47,9 @@ func NewService(routeProvider route.RouteProvider, stationFinder StationFinder, 
 	if c.TargetChargePercent <= c.CriticalChargePercent {
 		return nil, errors.New("target charge must be above critical charge")
 	}
+	if c.TargetChargePercent <= 0 || c.TargetChargePercent >= 100 {
+		return nil, errors.New("target charge must be in [0, 100]")
+	}
 	if c.MinArrivalPercent >= c.CriticalChargePercent {
 		return nil, errors.New("min arrival must be below critical charge")
 	}

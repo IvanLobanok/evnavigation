@@ -31,9 +31,9 @@ func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radi
 	}
 
 	var filtered []station.ChargingStation
-	for _, station := range stations {
-		if hasCommonConnector(preferredConnectors, station.ConnectorTypes) {
-			filtered = append(filtered, station)
+	for _, st := range stations {
+		if hasCommonConnector(preferredConnectors, st.ConnectorTypes) {
+			filtered = append(filtered, st)
 		}
 	}
 	return filtered, nil
