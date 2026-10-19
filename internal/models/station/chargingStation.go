@@ -1,7 +1,12 @@
 package station
 
 import (
+	"errors"
 	"time"
+)
+
+var (
+	ErrNotFound = errors.New("user not found")
 )
 
 type ChargingStation struct {

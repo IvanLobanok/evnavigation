@@ -9,18 +9,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+const evmodelColumns = `id, brand,model,battery_capacity_kwh, avg_consumption_kwh_100km, connector_type, max_charging_power_kw `
+
 func (r *Repository) GetAllEVModels(ctx context.Context) ([]evmodel.EVModel, error) {
-	query :=
-		`SELECT 
-				id, 
-				brand, 
-				model,
-				battery_capacity_kwh, 
-				avg_consumption_kwh_100km, 
-				connector_type, 
-				max_charging_power_kw 
-		FROM ev_models 
-		ORDER BY brand, model;`
+	query := `SELECT ` + evmodelColumns + `FROM ev_models ORDER BY brand, model;`
 
 	rows, err := r.db.Query(ctx, query)
 	if err != nil {
@@ -31,47 +23,37 @@ func (r *Repository) GetAllEVModels(ctx context.Context) ([]evmodel.EVModel, err
 	var models []evmodel.EVModel
 
 	for rows.Next() {
-		var m evmodel.EVModel
-		if err := rows.Scan(
-			&m.ID,
-			&m.Brand,
-			&m.Model,
-			&m.BatteryCapacityKwh,
-			&m.AvgConsumptionKwh100km,
-			&m.ConnectorType,
-			&m.MaxChargingPowerKw,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan ev model: %w", err)
+		m, err := r.scanEVModel(rows)
+		if err != nil {
+			return nil, err
 		}
-		models = append(models, m)
+		models = append(models, *m)
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
+
+	if models == nil {
+		models = []evmodel.EVModel{}
+	}
+
 	return models, nil
 }
 
 func (r *Repository) GetEVModelByID(ctx context.Context, id int) (*evmodel.EVModel, error) {
-	query :=
-		`SELECT 
-				id, 
-				brand, 
-				model,
-				battery_capacity_kwh, 
-				avg_consumption_kwh_100km, 
-				connector_type, 
-				max_charging_power_kw 
-		FROM ev_models 
-		WHERE id = $1`
+	query := `SELECT` + evmodelColumns + `FROM ev_models WHERE id = $1`
+	return r.scanEVModel(r.db.QueryRow(ctx, query, id))
+}
 
-	var model evmodel.EVModel
-	err := r.db.QueryRow(ctx, query, id).Scan(&model.ID, &model.Brand, &model.Model, &model.BatteryCapacityKwh, &model.AvgConsumptionKwh100km, &model.ConnectorType, &model.MaxChargingPowerKw)
+func (r *Repository) scanEVModel(row pgx.Row) (*evmodel.EVModel, error) {
+	var m evmodel.EVModel
+	err := row.Scan(&m.ID, &m.Brand, &m.Model, &m.BatteryCapacityKwh, &m.AvgConsumptionKwh100km, &m.ConnectorType, &m.MaxChargingPowerKw)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, evmodel.ErrNotFound
 		}
-		return nil, fmt.Errorf("failed to query EVModel: %w", err)
+		return nil, fmt.Errorf("get EVModel: %w", err)
 	}
-	return &model, nil
+	return &m, nil
 }

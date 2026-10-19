@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/station"
+	"github.com/jackc/pgx/v5"
 )
 
 func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon float64, radiusMeters float64) ([]station.ChargingStation, error) {
@@ -29,19 +31,11 @@ func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon float64, r
 	var stations []station.ChargingStation
 
 	for rows.Next() {
-		var s station.ChargingStation
-		if err := rows.Scan(
-			&s.ID,
-			&s.Name,
-			&s.Latitude,
-			&s.Longitude,
-			&s.PowerKW,
-			&s.ConnectorTypes,
-			&s.IsOperational,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan station: %w", err)
+		s, err := r.scanStantion(rows)
+		if err != nil {
+			return nil, err
 		}
-		stations = append(stations, s)
+		stations = append(stations, *s)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -49,4 +43,16 @@ func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon float64, r
 	}
 
 	return stations, nil
+}
+
+func (r *Repository) scanStantion(row pgx.Row) (*station.ChargingStation, error) {
+	var s station.ChargingStation
+	err := row.Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.PowerKW, &s.ConnectorTypes, &s.IsOperational)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, station.ErrNotFound
+		}
+		return nil, fmt.Errorf("get station: %w", err)
+	}
+	return &s, nil
 }
