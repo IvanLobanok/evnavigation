@@ -215,7 +215,7 @@ func TestAnalyzeRoute(t *testing.T) {
 func TestAnalyzeRoute_CriticalFlagsAroundThreshold(t *testing.T) {
 	svc, _, _ := newTestService(t, testConfig())
 
-	// старт 50%, 2 кВт·ч на 10 км: на 170 км остаётся 16%, на 180 км — 14%
+	// старт 50%, 2 кВт·ч на 10 км: на 170 км остаётся 16%, на 180 км - 14%
 	got, err := svc.analyzeRoute(context.Background(), pt(0), pt(200), testEV, 50)
 	if err != nil {
 		t.Fatal(err)
@@ -411,7 +411,7 @@ func TestPlanRoute_OneStopDetails(t *testing.T) {
 	approx(t, "arrival percent", stop.ArrivalPercent, 14.4, 1e-3)
 	approx(t, "depart percent", stop.DepartPercent, 80, 1e-9)
 
-	// первый лег заканчивается на станции, второй — на финише
+	// первый лег заканчивается на станции, второй - на финише
 	approx(t, "leg 0 ends at station (km)", kmOf(plan.Legs[0].last().Point), 228, 1e-3)
 	approx(t, "leg 1 ends at finish (km)", kmOf(plan.Legs[1].last().Point), 400, 1e-3)
 
@@ -432,7 +432,7 @@ func TestPlanRoute_UnreachableStationIsCheckedOnlyOnce(t *testing.T) {
 	if !errors.Is(err, ErrStationUnreachable) {
 		t.Fatalf("got %v, want ErrStationUnreachable", err)
 	}
-	// 1 вызов — общий анализ маршрута, 1 — проверка единственной станции.
+	// 1 вызов - общий анализ маршрута, 1 - проверка единственной станции.
 	// Повторные находки той же станции при откате не должны порождать новых запросов.
 	if prov.calls != 2 {
 		t.Errorf("provider calls: got %d, want 2", prov.calls)
@@ -505,6 +505,9 @@ func TestNewService_ConfigValidation(t *testing.T) {
 		{"target equal to critical", func(c *Config) { c.TargetChargePercent = c.CriticalChargePercent }, true},
 		{"min arrival above critical", func(c *Config) { c.MinArrivalPercent = 20 }, true},
 		{"min arrival equal to critical", func(c *Config) { c.MinArrivalPercent = c.CriticalChargePercent }, true},
+		{"target at 100", func(c *Config) { c.TargetChargePercent = 100 }, true},
+		{"target above 100", func(c *Config) { c.TargetChargePercent = 120 }, true},
+		{"target just below 100", func(c *Config) { c.TargetChargePercent = 99.9 }, false},
 		{"zero max stops", func(c *Config) { c.MaxStops = 0 }, true},
 		{"negative max stops", func(c *Config) { c.MaxStops = -1 }, true},
 		{"zero station candidates", func(c *Config) { c.MaxStationCandidates = 0 }, true},

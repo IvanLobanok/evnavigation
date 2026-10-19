@@ -2,41 +2,40 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
+	"github.com/IvanLobanok/evnavigation/internal/models/user"
 	"github.com/IvanLobanok/evnavigation/internal/service/routing"
 )
-
-const maxBodyBytes = 1 << 20
 
 type RoutePlanner interface {
 	PlanRoute(ctx context.Context, from, to route.RoutePoint, ev evmodel.EVModel, startPercent float64) (*routing.RoutePlan, error)
 }
 
-type EVModelProvider interface {
-	GetEVModelByID(ctx context.Context, id int) (*evmodel.EVModel, error)
+// VehicleResolver отдаёт машину пользователя вместе с моделью (реализует vehicle.Service).
+// Чужая машина не находится: ownership проверяется на уровне запроса.
+type VehicleResolver interface {
+	GetVehicle(ctx context.Context, userID, vehicleID int) (*user.VehicleDetails, error)
 }
 
 type RoutesHandler struct {
-	planner RoutePlanner
-	models  EVModelProvider
-	log     *slog.Logger
+	planner  RoutePlanner
+	vehicles VehicleResolver
+	log      *slog.Logger
 }
 
-func NewRoutesHandler(planner RoutePlanner, models EVModelProvider, log *slog.Logger) *RoutesHandler {
+func NewRoutesHandler(planner RoutePlanner, vehicles VehicleResolver, log *slog.Logger) *RoutesHandler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &RoutesHandler{
-		planner: planner,
-		models:  models,
-		log:     log,
+		planner:  planner,
+		vehicles: vehicles,
+		log:      log,
 	}
 }
 
@@ -50,13 +49,13 @@ type pointRequest struct {
 type planRouteRequest struct {
 	From                 *pointRequest `json:"from"`
 	To                   *pointRequest `json:"to"`
-	EVModelID            int           `json:"ev_model_id"`
+	VehicleID            int           `json:"vehicle_id"`
 	CurrentChargePercent *float64      `json:"current_charge_percent"`
 }
 
 type validatedRequest struct {
 	from, to      route.RoutePoint
-	evModelID     int
+	vehicleID     int
 	chargePercent float64
 }
 
@@ -83,11 +82,11 @@ func (r planRouteRequest) validate() (validatedRequest, map[string]string) {
 	v := validatedRequest{
 		from:      point("from", r.From),
 		to:        point("to", r.To),
-		evModelID: r.EVModelID,
+		vehicleID: r.VehicleID,
 	}
 
-	if r.EVModelID <= 0 {
-		details["ev_model_id"] = "is required and must be a positive integer"
+	if r.VehicleID <= 0 {
+		details["vehicle_id"] = "is required and must be a positive integer"
 	}
 	if r.CurrentChargePercent == nil || *r.CurrentChargePercent < 0 || *r.CurrentChargePercent > 100 {
 		details["current_charge_percent"] = "is required and must be between 0 and 100"
@@ -180,30 +179,34 @@ func toResponse(plan *routing.RoutePlan) planRouteResponse {
 // post /routes
 
 func (h *RoutesHandler) PlanRoute(w http.ResponseWriter, r *http.Request) {
-	req, ok := decodeRequest(w, r)
+	userID, ok := requireUser(w, r)
 	if !ok {
+		return
+	}
+
+	var req planRouteRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
 	v, details := req.validate()
 	if details != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: errorBody{
-			Code: "validation_error", Message: "request validation failed", Details: details,
-		}})
+		writeValidationError(w, details)
 		return
 	}
 
-	ev, err := h.models.GetEVModelByID(r.Context(), v.evModelID)
+	// машина ищется среди машин ИМЕННО этого пользователя: чужой vehicle_id даёт 404, а не данные соседа
+	d, err := h.vehicles.GetVehicle(r.Context(), userID, v.vehicleID)
 	switch {
-	case errors.Is(err, evmodel.ErrNotFound):
-		writeError(w, http.StatusNotFound, "ev_model_not_found", "ev model with the given id does not exist")
+	case errors.Is(err, user.ErrVehicleNotFound):
+		writeError(w, http.StatusNotFound, "vehicle_not_found", "vehicle not found")
 		return
 	case err != nil:
-		h.internalError(w, r, "get ev model", err)
+		internalError(w, r, h.log, "get vehicle", err)
 		return
 	}
 
-	plan, err := h.planner.PlanRoute(r.Context(), v.from, v.to, *ev, v.chargePercent)
+	plan, err := h.planner.PlanRoute(r.Context(), v.from, v.to, d.EVModel, v.chargePercent)
 	if err != nil {
 		h.writePlanError(w, r, plan, err)
 		return
@@ -217,31 +220,6 @@ func (h *RoutesHandler) PlanRoute(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func decodeRequest(w http.ResponseWriter, r *http.Request) (planRouteRequest, bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	var req planRouteRequest
-	err := dec.Decode(&req)
-	if err == nil {
-		// после объекта не должно быть ничего, кроме пробелов
-		if _, extra := dec.Token(); !errors.Is(extra, io.EOF) {
-			err = errors.New("unexpected data after JSON object")
-		}
-	}
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "request body is too large")
-			return req, false
-		}
-		writeError(w, http.StatusBadRequest, "invalid_json", "request body is not valid JSON or contains unknown fields")
-		return req, false
-	}
-	return req, true
-}
-
 func (h *RoutesHandler) writePlanError(w http.ResponseWriter, r *http.Request, plan *routing.RoutePlan, err error) {
 	var code, message string
 	switch {
@@ -252,7 +230,7 @@ func (h *RoutesHandler) writePlanError(w http.ResponseWriter, r *http.Request, p
 	case errors.Is(err, routing.ErrTooManyStops):
 		code, message = "too_many_stops", "the route requires more charging stops than allowed"
 	default:
-		h.internalError(w, r, "plan route", err)
+		internalError(w, r, h.log, "plan route", err)
 		return
 	}
 
@@ -262,9 +240,4 @@ func (h *RoutesHandler) writePlanError(w http.ResponseWriter, r *http.Request, p
 		resp.PartialPlan = &partial
 	}
 	writeJSON(w, http.StatusUnprocessableEntity, resp)
-}
-
-func (h *RoutesHandler) internalError(w http.ResponseWriter, r *http.Request, op string, err error) {
-	h.log.Error("request failed", "op", op, "path", r.URL.Path, "error", err)
-	writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 }

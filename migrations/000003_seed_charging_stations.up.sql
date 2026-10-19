@@ -6,7 +6,7 @@
 
 INSERT INTO charging_stations (name, location, connector_types, power_kw, is_operational, source) VALUES
 
--- BatteryFly — сеть быстрых станций
+-- BatteryFly - сеть быстрых станций
 ('BatteryFly ЭЗС №73, ул. Свердлова 11', ST_MakePoint(27.5556, 53.9006)::geography,
  ARRAY['GB/T DC', 'CCS Combo 2'], 160, true, 'manual'),
 
@@ -25,7 +25,7 @@ INSERT INTO charging_stations (name, location, connector_types, power_kw, is_ope
 ('BatteryFly, просп. Жукова 29', ST_MakePoint(27.4964, 53.9425)::geography,
  ARRAY['CCS Combo 2'], 80, true, 'manual'),
 
--- Malanka — сеть станций разной мощности
+-- Malanka - сеть станций разной мощности
 ('Malanka, просп. Независимости 3/2', ST_MakePoint(27.5619, 53.9006)::geography,
  ARRAY['CHAdeMO', 'GB/T DC', 'CCS Combo 2'], 50, true, 'manual'),
 
@@ -42,7 +42,7 @@ INSERT INTO charging_stations (name, location, connector_types, power_kw, is_ope
 ('Зарядка, ул. Ленина 27', ST_MakePoint(27.5567, 53.9003)::geography,
  ARRAY['CHAdeMO', 'CCS Combo 2'], 120, true, 'manual'),
 
--- Zaryadka — хабы по городу
+-- Zaryadka - хабы по городу
 ('Zaryadka, Игуменский тракт 22', ST_MakePoint(27.6428, 53.9186)::geography,
  ARRAY['Type 2', 'CCS Combo 2'], 60, true, 'manual'),
 
@@ -52,6 +52,6 @@ INSERT INTO charging_stations (name, location, connector_types, power_kw, is_ope
 ('Zaryadka, пр. Партизанский 178', ST_MakePoint(27.5981, 53.8408)::geography,
  ARRAY['Type 2', 'CCS Combo 2'], 60, true, 'manual'),
 
--- United Company — ЭЗК с более крупной инфраструктурой (АЗС-хаб)
+-- United Company - ЭЗК с более крупной инфраструктурой (АЗС-хаб)
 ('United Company ЭЗК №8, просп. Победителей 102', ST_MakePoint(27.5297, 53.9364)::geography,
  ARRAY['GB/T DC', 'CCS Combo 2', 'CHAdeMO'], 150, true, 'manual');

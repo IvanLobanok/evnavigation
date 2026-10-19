@@ -18,7 +18,7 @@ var (
 	ErrTooManyStops       = errors.New("route requires too many charging stops")
 )
 
-// StationFinder — интерфейс для поиска зарядных станций (изолирует базу данных / репозиторий).
+// StationFinder - интерфейс для поиска зарядных станций (изолирует базу данных / репозиторий).
 type StationFinder interface {
 	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error)
 }
@@ -48,7 +48,7 @@ func NewService(routeProvider route.RouteProvider, stationFinder StationFinder, 
 		return nil, errors.New("target charge must be above critical charge")
 	}
 	if c.TargetChargePercent <= 0 || c.TargetChargePercent >= 100 {
-		return nil, errors.New("target charge must be in [0, 100]")
+		return nil, errors.New("target charge must be in (0, 100)")
 	}
 	if c.MinArrivalPercent >= c.CriticalChargePercent {
 		return nil, errors.New("min arrival must be below critical charge")
@@ -121,7 +121,7 @@ func (s *RouteService) PlanRoute(ctx context.Context, from, to route.RoutePoint,
 			return nil, err
 		}
 
-		// 2. Если заряд позволяет доехать до конца без остановок — завершаем построение
+		// 2. Если заряд позволяет доехать до конца без остановок - завершаем построение
 		if analysis.ReachesDestination {
 			plan.addLeg(analysis)
 			return plan, nil
@@ -203,7 +203,7 @@ func (s *RouteService) analyzeRoute(ctx context.Context, from, to route.RoutePoi
 		})
 	}
 
-	// Точка 0 — начальная позиция
+	// Точка 0 - начальная позиция
 	addPoint(from)
 
 	// Симуляция движения по каждому сегменту маршрута
@@ -237,7 +237,7 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
 	for i := critIdx; i >= 0; i-- {
 		p := analysis.Points[i]
 
-		// Если отошли назад дальше допустимого лимита — прекращаем поиск
+		// Если отошли назад дальше допустимого лимита - прекращаем поиск
 		if critKm-p.CumulativeDistanceKm > s.config.MaxLookbackKm {
 			break
 		}
@@ -276,7 +276,7 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
 			if err != nil {
 				return station.ChargingStation{}, nil, err
 			}
-			// Если доехали и остаток заряда выше или равен минимальному порогу приезда — станция найдена!
+			// Если доехали и остаток заряда выше или равен минимальному порогу приезда - станция найдена!
 			if leg.last().RemainingBatteryPercent >= s.config.MinArrivalPercent {
 				return c, leg, nil
 			}

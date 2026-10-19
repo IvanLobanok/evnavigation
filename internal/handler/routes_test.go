@@ -14,6 +14,7 @@ import (
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
 	"github.com/IvanLobanok/evnavigation/internal/models/station"
+	"github.com/IvanLobanok/evnavigation/internal/models/user"
 	"github.com/IvanLobanok/evnavigation/internal/service/routing"
 )
 
@@ -37,32 +38,41 @@ func (f *fakePlanner) PlanRoute(_ context.Context, from, to route.RoutePoint, ev
 	return f.plan, f.err
 }
 
-type fakeModels struct {
-	model *evmodel.EVModel
-	err   error
-	gotID int
+const testUserID = 5
+
+type fakeVehicles struct {
+	details *user.VehicleDetails
+	err     error
+
+	gotUserID, gotVehicleID int
 }
 
-func (f *fakeModels) GetEVModelByID(_ context.Context, id int) (*evmodel.EVModel, error) {
-	f.gotID = id
-	return f.model, f.err
+func (f *fakeVehicles) GetVehicle(_ context.Context, userID, vehicleID int) (*user.VehicleDetails, error) {
+	f.gotUserID, f.gotVehicleID = userID, vehicleID
+	return f.details, f.err
 }
 
-var testModel = &evmodel.EVModel{ID: 7, Brand: "Geely", Model: "EX5", BatteryCapacityKwh: 60, AvgConsumptionKwh100km: 15, ConnectorType: "CCS2"}
+var testModel = &evmodel.EVModel{ID: 3, Brand: "Geely", Model: "EX5", BatteryCapacityKwh: 60, AvgConsumptionKwh100km: 15, ConnectorType: "CCS2"}
+
+var testVehicle = &user.VehicleDetails{
+	UserVehicle: user.UserVehicle{ID: 7, UserID: testUserID, EVModelID: 3},
+	EVModel:     *testModel,
+}
 
 const validBody = `{
 	"from": {"lat": 53.9, "lon": 27.56},
 	"to":   {"lat": 53.5, "lon": 27.1},
-	"ev_model_id": 7,
+	"vehicle_id": 7,
 	"current_charge_percent": 60
 }`
 
-func newHandler(p *fakePlanner, m *fakeModels) *RoutesHandler {
-	return NewRoutesHandler(p, m, nil)
+func newHandler(p *fakePlanner, v *fakeVehicles) *RoutesHandler {
+	return NewRoutesHandler(p, v, nil)
 }
 
 func post(h *RoutesHandler, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/routes", strings.NewReader(body))
+	req = req.WithContext(withUserID(req.Context(), testUserID)) // как после middleware Authenticate
 	rec := httptest.NewRecorder()
 	h.PlanRoute(rec, req)
 	return rec
@@ -111,9 +121,9 @@ func samplePlan() *routing.RoutePlan {
 
 func TestPlanRoute_Success(t *testing.T) {
 	planner := &fakePlanner{plan: samplePlan()}
-	models := &fakeModels{model: testModel}
+	vehicles := &fakeVehicles{details: testVehicle}
 
-	rec := post(newHandler(planner, models), validBody)
+	rec := post(newHandler(planner, vehicles), validBody)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want 200; body: %s", rec.Code, rec.Body)
@@ -122,9 +132,9 @@ func TestPlanRoute_Success(t *testing.T) {
 		t.Errorf("content-type: got %q", ct)
 	}
 
-	// запрос корректно передан вниз по слоям
-	if models.gotID != 7 {
-		t.Errorf("ev model id: got %d, want 7", models.gotID)
+	// запрос корректно передан вниз по слоям: машина ищется среди машин текущего пользователя
+	if vehicles.gotVehicleID != 7 || vehicles.gotUserID != testUserID {
+		t.Errorf("vehicle lookup: got user=%d vehicle=%d, want user=%d vehicle=7", vehicles.gotUserID, vehicles.gotVehicleID, testUserID)
 	}
 	if planner.gotEV.Model != "EX5" {
 		t.Errorf("planner got wrong ev model: %+v", planner.gotEV)
@@ -170,7 +180,7 @@ func TestPlanRoute_NoStopsReturnsEmptyArraysNotNull(t *testing.T) {
 		}},
 		TotalDistanceKm: 10,
 	}
-	rec := post(newHandler(&fakePlanner{plan: plan}, &fakeModels{model: testModel}), validBody)
+	rec := post(newHandler(&fakePlanner{plan: plan}, &fakeVehicles{details: testVehicle}), validBody)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
@@ -182,10 +192,10 @@ func TestPlanRoute_NoStopsReturnsEmptyArraysNotNull(t *testing.T) {
 }
 
 func TestPlanRoute_ZeroCoordinatesAndZeroChargeAreValid(t *testing.T) {
-	body := `{"from":{"lat":0,"lon":0},"to":{"lat":0,"lon":1},"ev_model_id":1,"current_charge_percent":0}`
+	body := `{"from":{"lat":0,"lon":0},"to":{"lat":0,"lon":1},"vehicle_id":1,"current_charge_percent":0}`
 	planner := &fakePlanner{plan: samplePlan()}
 
-	rec := post(newHandler(planner, &fakeModels{model: testModel}), body)
+	rec := post(newHandler(planner, &fakeVehicles{details: testVehicle}), body)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("zeros must be accepted, got %d: %s", rec.Code, rec.Body)
@@ -206,14 +216,14 @@ func TestPlanRoute_BadJSON(t *testing.T) {
 	}{
 		{"not json", `hello`},
 		{"empty body", ``},
-		{"unknown field", `{"from":{"lat":1,"lon":1},"to":{"lat":1,"lon":1},"ev_model_id":1,"current_charge_percent":50,"extra":1}`},
-		{"wrong type", `{"from":{"lat":"x","lon":1},"to":{"lat":1,"lon":1},"ev_model_id":1,"current_charge_percent":50}`},
+		{"unknown field", `{"from":{"lat":1,"lon":1},"to":{"lat":1,"lon":1},"vehicle_id":1,"current_charge_percent":50,"extra":1}`},
+		{"wrong type", `{"from":{"lat":"x","lon":1},"to":{"lat":1,"lon":1},"vehicle_id":1,"current_charge_percent":50}`},
 		{"trailing garbage", validBody + ` {"again": true}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			planner := &fakePlanner{plan: samplePlan()}
-			rec := post(newHandler(planner, &fakeModels{model: testModel}), tc.body)
+			rec := post(newHandler(planner, &fakeVehicles{details: testVehicle}), tc.body)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status: got %d, want 400", rec.Code)
@@ -233,7 +243,7 @@ func TestPlanRoute_Validation(t *testing.T) {
 		return fmt.Sprintf(`{"from":%s,"to":%s,%s}`, from, to, rest)
 	}
 	okPt := `{"lat":53.9,"lon":27.5}`
-	okRest := `"ev_model_id":1,"current_charge_percent":50`
+	okRest := `"vehicle_id":1,"current_charge_percent":50`
 
 	tests := []struct {
 		name      string
@@ -246,18 +256,18 @@ func TestPlanRoute_Validation(t *testing.T) {
 		{"lat too low", body(okPt, `{"lat":-90.5,"lon":0}`, okRest), "to.lat"},
 		{"lon too high", body(`{"lat":0,"lon":181}`, okPt, okRest), "from.lon"},
 		{"missing lon", body(`{"lat":10}`, okPt, okRest), "from.lon"},
-		{"missing ev_model_id", body(okPt, okPt, `"current_charge_percent":50`), "ev_model_id"},
-		{"negative ev_model_id", body(okPt, okPt, `"ev_model_id":-3,"current_charge_percent":50`), "ev_model_id"},
-		{"missing charge", body(okPt, okPt, `"ev_model_id":1`), "current_charge_percent"},
-		{"charge above 100", body(okPt, okPt, `"ev_model_id":1,"current_charge_percent":100.5`), "current_charge_percent"},
-		{"negative charge", body(okPt, okPt, `"ev_model_id":1,"current_charge_percent":-1`), "current_charge_percent"},
+		{"missing vehicle_id", body(okPt, okPt, `"current_charge_percent":50`), "vehicle_id"},
+		{"negative vehicle_id", body(okPt, okPt, `"vehicle_id":-3,"current_charge_percent":50`), "vehicle_id"},
+		{"missing charge", body(okPt, okPt, `"vehicle_id":1`), "current_charge_percent"},
+		{"charge above 100", body(okPt, okPt, `"vehicle_id":1,"current_charge_percent":100.5`), "current_charge_percent"},
+		{"negative charge", body(okPt, okPt, `"vehicle_id":1,"current_charge_percent":-1`), "current_charge_percent"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			planner := &fakePlanner{plan: samplePlan()}
-			models := &fakeModels{model: testModel}
+			vehicles := &fakeVehicles{details: testVehicle}
 
-			rec := post(newHandler(planner, models), tc.body)
+			rec := post(newHandler(planner, vehicles), tc.body)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status: got %d, want 400; body: %s", rec.Code, rec.Body)
@@ -269,7 +279,7 @@ func TestPlanRoute_Validation(t *testing.T) {
 			if _, ok := e.Error.Details[tc.wantField]; !ok {
 				t.Errorf("details must mention %q, got %v", tc.wantField, e.Error.Details)
 			}
-			if planner.calls != 0 || models.gotID != 0 {
+			if planner.calls != 0 || vehicles.gotVehicleID != 0 {
 				t.Error("neither repository nor planner may be called on invalid input")
 			}
 		})
@@ -277,10 +287,10 @@ func TestPlanRoute_Validation(t *testing.T) {
 }
 
 func TestPlanRoute_ValidationReportsAllProblemsAtOnce(t *testing.T) {
-	rec := post(newHandler(&fakePlanner{}, &fakeModels{}), `{"ev_model_id":0}`)
+	rec := post(newHandler(&fakePlanner{}, &fakeVehicles{}), `{"vehicle_id":0}`)
 
 	details := decodeErr(t, rec).Error.Details
-	for _, field := range []string{"from", "to", "ev_model_id", "current_charge_percent"} {
+	for _, field := range []string{"from", "to", "vehicle_id", "current_charge_percent"} {
 		if _, ok := details[field]; !ok {
 			t.Errorf("expected problem for %q, got %v", field, details)
 		}
@@ -290,7 +300,7 @@ func TestPlanRoute_ValidationReportsAllProblemsAtOnce(t *testing.T) {
 func TestPlanRoute_BodyTooLarge(t *testing.T) {
 	huge := `{"from":{"lat":1,"lon":1},"pad":"` + strings.Repeat("a", maxBodyBytes+10) + `"}`
 
-	rec := post(newHandler(&fakePlanner{}, &fakeModels{}), huge)
+	rec := post(newHandler(&fakePlanner{}, &fakeVehicles{}), huge)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status: got %d, want 413", rec.Code)
@@ -304,17 +314,17 @@ func TestPlanRoute_BodyTooLarge(t *testing.T) {
 // Ошибки зависимостей
 // ---------------------------------------------------------------------------
 
-func TestPlanRoute_EVModelNotFound(t *testing.T) {
+func TestPlanRoute_VehicleNotFound(t *testing.T) {
 	planner := &fakePlanner{plan: samplePlan()}
-	// репозиторий оборачивает ошибку: errors.Is должен всё равно сработать
-	models := &fakeModels{err: fmt.Errorf("failed to query EVModel: %w", evmodel.ErrNotFound)}
+	// сервис может обернуть ошибку: errors.Is должен всё равно сработать
+	vehicles := &fakeVehicles{err: fmt.Errorf("get vehicle: %w", user.ErrVehicleNotFound)}
 
-	rec := post(newHandler(planner, models), validBody)
+	rec := post(newHandler(planner, vehicles), validBody)
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status: got %d, want 404", rec.Code)
 	}
-	if code := decodeErr(t, rec).Error.Code; code != "ev_model_not_found" {
+	if code := decodeErr(t, rec).Error.Code; code != "vehicle_not_found" {
 		t.Errorf("code: got %q", code)
 	}
 	if planner.calls != 0 {
@@ -322,20 +332,37 @@ func TestPlanRoute_EVModelNotFound(t *testing.T) {
 	}
 }
 
+func TestPlanRoute_WithoutAuthenticatedUserIsRejected(t *testing.T) {
+	planner := &fakePlanner{plan: samplePlan()}
+	vehicles := &fakeVehicles{details: testVehicle}
+
+	// запрос без withUserID в контексте: так выглядит роутер, где забыли middleware Authenticate
+	req := httptest.NewRequest(http.MethodPost, "/routes", strings.NewReader(validBody))
+	rec := httptest.NewRecorder()
+	newHandler(planner, vehicles).PlanRoute(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status: got %d, want 401", rec.Code)
+	}
+	if planner.calls != 0 || vehicles.gotVehicleID != 0 {
+		t.Error("nothing may be called for an anonymous request")
+	}
+}
+
 func TestPlanRoute_InternalErrorsDoNotLeakDetails(t *testing.T) {
 	secret := "pq: password authentication failed for user postgres"
 
 	tests := []struct {
-		name    string
-		planner *fakePlanner
-		models  *fakeModels
+		name     string
+		planner  *fakePlanner
+		vehicles *fakeVehicles
 	}{
-		{"repository failure", &fakePlanner{}, &fakeModels{err: errors.New(secret)}},
-		{"planner failure", &fakePlanner{err: fmt.Errorf("failed to build route: %w", errors.New(secret))}, &fakeModels{model: testModel}},
+		{"repository failure", &fakePlanner{}, &fakeVehicles{err: errors.New(secret)}},
+		{"planner failure", &fakePlanner{err: fmt.Errorf("failed to build route: %w", errors.New(secret))}, &fakeVehicles{details: testVehicle}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := post(newHandler(tc.planner, tc.models), validBody)
+			rec := post(newHandler(tc.planner, tc.vehicles), validBody)
 
 			if rec.Code != http.StatusInternalServerError {
 				t.Fatalf("status: got %d, want 500", rec.Code)
@@ -367,7 +394,7 @@ func TestPlanRoute_RoutingErrors(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := post(newHandler(&fakePlanner{plan: &routing.RoutePlan{}, err: tc.err}, &fakeModels{model: testModel}), validBody)
+			rec := post(newHandler(&fakePlanner{plan: &routing.RoutePlan{}, err: tc.err}, &fakeVehicles{details: testVehicle}), validBody)
 
 			if rec.Code != http.StatusUnprocessableEntity {
 				t.Fatalf("status: got %d, want 422", rec.Code)
@@ -384,7 +411,7 @@ func TestPlanRoute_PartialPlanIsReturnedWithRoutingError(t *testing.T) {
 	partial := samplePlan()
 	partial.Legs = partial.Legs[:1]
 
-	rec := post(newHandler(&fakePlanner{plan: partial, err: routing.ErrNoStationNearby}, &fakeModels{model: testModel}), validBody)
+	rec := post(newHandler(&fakePlanner{plan: partial, err: routing.ErrNoStationNearby}, &fakeVehicles{details: testVehicle}), validBody)
 
 	e := decodeErr(t, rec)
 	if e.PartialPlan == nil {
@@ -399,7 +426,7 @@ func TestPlanRoute_PartialPlanIsReturnedWithRoutingError(t *testing.T) {
 }
 
 func TestPlanRoute_EmptyPlanIsNotReturnedAsPartial(t *testing.T) {
-	rec := post(newHandler(&fakePlanner{plan: &routing.RoutePlan{}, err: routing.ErrNoStationNearby}, &fakeModels{model: testModel}), validBody)
+	rec := post(newHandler(&fakePlanner{plan: &routing.RoutePlan{}, err: routing.ErrNoStationNearby}, &fakeVehicles{details: testVehicle}), validBody)
 
 	if strings.Contains(rec.Body.String(), "partial_plan") {
 		t.Errorf("empty plan must not appear in the response: %s", rec.Body)
