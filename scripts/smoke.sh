@@ -48,6 +48,10 @@ call GET  /ev-models 200
 MODEL_ID=$(json_first id)
 echo "      выбрана модель id=$MODEL_ID"
 
+# станции — публичный эндпоинт. Вызываем ПОСЛЕ того, как забрали MODEL_ID: json_first читает последний ответ
+call GET  "/stations/nearby?lat=53.9006&lon=27.5590&radius_km=3&limit=3" 200
+call GET  "/stations/nearby?lat=999&lon=27.5590" 400
+
 call POST /vehicles 201 "{\"ev_model_id\":$MODEL_ID,\"nickname\":\"smoke car\"}" "$TOKEN"
 VEHICLE_ID=$(json_first id)
 call GET  "/vehicles/$VEHICLE_ID" 200 "" "$TOKEN"

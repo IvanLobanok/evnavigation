@@ -224,3 +224,178 @@ func TestVehicles_DeletingUserCascades(t *testing.T) {
 		t.Errorf("vehicle must be removed with its owner: n=%d err=%v", n, err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Каталог моделей
+// ---------------------------------------------------------------------------
+
+func TestEVModels_GetAll(t *testing.T) {
+	r, _ := newTestRepo(t)
+
+	models, err := r.GetAllEVModels(context.Background())
+	if err != nil {
+		t.Fatalf("GetAllEVModels: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("seed models are missing (is migration 000002 applied?)")
+	}
+	for _, m := range models {
+		if m.ID <= 0 || m.Brand == "" || m.Model == "" || m.BatteryCapacityKwh <= 0 ||
+			m.AvgConsumptionKwh100km <= 0 || m.ConnectorType == "" || m.MaxChargingPowerKw <= 0 {
+			t.Errorf("model is not fully loaded: %+v", m)
+		}
+	}
+	// ORDER BY brand, model
+	for i := 1; i < len(models); i++ {
+		a, b := models[i-1], models[i]
+		if a.Brand > b.Brand || (a.Brand == b.Brand && a.Model > b.Model) {
+			t.Errorf("models are not sorted by brand, model: %s %s before %s %s", a.Brand, a.Model, b.Brand, b.Model)
+		}
+	}
+}
+
+func TestEVModels_GetByID(t *testing.T) {
+	r, _ := newTestRepo(t)
+	ctx := context.Background()
+
+	all, err := r.GetAllEVModels(ctx)
+	if err != nil || len(all) == 0 {
+		t.Fatalf("GetAllEVModels: %v (n=%d)", err, len(all))
+	}
+
+	for _, want := range all {
+		got, err := r.GetEVModelByID(ctx, want.ID)
+		if err != nil {
+			t.Fatalf("GetEVModelByID(%d): %v", want.ID, err)
+		}
+		if *got != want {
+			t.Errorf("GetEVModelByID(%d) differs from the catalog entry:\n got  %+v\n want %+v", want.ID, *got, want)
+		}
+	}
+}
+
+func TestEVModels_GetByIDNotFound(t *testing.T) {
+	r, _ := newTestRepo(t)
+
+	if _, err := r.GetEVModelByID(context.Background(), 2_000_000_000); !errors.Is(err, evmodel.ErrNotFound) {
+		t.Errorf("got %v, want evmodel.ErrNotFound", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Станции (PostGIS)
+// ---------------------------------------------------------------------------
+
+// seededStation берёт реальную станцию из сид-миграции, чтобы тест не зависел от конкретных координат.
+func seededStation(t *testing.T, pool *pgxpool.Pool) (id int64, lat, lon float64) {
+	t.Helper()
+	err := pool.QueryRow(context.Background(), `
+		SELECT id, ST_Y(location::geometry), ST_X(location::geometry)
+		FROM charging_stations WHERE is_operational ORDER BY id LIMIT 1`).Scan(&id, &lat, &lon)
+	if err != nil {
+		t.Fatalf("no seeded stations (is migration 000003 applied?): %v", err)
+	}
+	return id, lat, lon
+}
+
+func TestStations_FindNearby(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	id, lat, lon := seededStation(t, pool)
+
+	found, err := r.FindNearbyStations(ctx, lat, lon, 100)
+	if err != nil {
+		t.Fatalf("FindNearbyStations: %v", err)
+	}
+	if len(found) == 0 || found[0].ID != id {
+		t.Fatalf("the station at the query point must come first, got %+v", found)
+	}
+
+	s := found[0]
+	if s.Name == "" || len(s.ConnectorTypes) == 0 || s.PowerKW <= 0 || !s.IsOperational {
+		t.Errorf("station fields are not loaded: %+v", s)
+	}
+	// ST_Y/ST_X возвращают то, что записано в location: широта и долгота не перепутаны
+	if diff := s.Latitude - lat; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("latitude: got %v, want %v", s.Latitude, lat)
+	}
+	if diff := s.Longitude - lon; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("longitude: got %v, want %v", s.Longitude, lon)
+	}
+}
+
+func TestStations_FindNearbyIsSortedByDistance(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	_, lat, lon := seededStation(t, pool)
+
+	found, err := r.FindNearbyStations(ctx, lat, lon, 30_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) < 2 {
+		t.Skipf("need at least 2 stations within 30 km to check ordering, got %d", len(found))
+	}
+
+	prev := -1.0
+	for _, s := range found {
+		var d float64
+		err := pool.QueryRow(ctx, `
+			SELECT ST_Distance(location, ST_SetSRID(ST_MakePoint($2,$3),4326)::geography)
+			FROM charging_stations WHERE id = $1`, s.ID, lon, lat).Scan(&d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d < prev {
+			t.Fatalf("stations are not ordered by distance: %v came after %v", d, prev)
+		}
+		prev = d
+	}
+}
+
+func TestStations_RadiusIsRespected(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+
+	// (0, 0) — Гвинейский залив: станций там нет
+	if found, err := r.FindNearbyStations(ctx, 0, 0, 50_000); err != nil || len(found) != 0 {
+		t.Errorf("far from every station: got %d stations, err=%v", len(found), err)
+	}
+
+	// чем больше радиус, тем не меньше станций
+	_, lat, lon := seededStation(t, pool)
+	small, err1 := r.FindNearbyStations(ctx, lat, lon, 100)
+	large, err2 := r.FindNearbyStations(ctx, lat, lon, 50_000)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("errors: %v %v", err1, err2)
+	}
+	if len(large) < len(small) {
+		t.Errorf("a larger radius returned fewer stations: %d < %d", len(large), len(small))
+	}
+}
+
+func TestStations_InactiveStationsAreHidden(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	_, lat, lon := seededStation(t, pool)
+
+	var inactiveID int64
+	err := pool.QueryRow(ctx, `
+		INSERT INTO charging_stations (name, location, connector_types, power_kw, is_operational)
+		VALUES ('integration-test inactive', ST_SetSRID(ST_MakePoint($1,$2),4326)::geography, ARRAY['CCS Combo 2'], 50, false)
+		RETURNING id`, lon, lat).Scan(&inactiveID)
+	if err != nil {
+		t.Fatalf("insert inactive station: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM charging_stations WHERE id = $1`, inactiveID) })
+
+	found, err := r.FindNearbyStations(ctx, lat, lon, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range found {
+		if s.ID == inactiveID {
+			t.Fatal("a non-operational station must not be returned")
+		}
+	}
+}

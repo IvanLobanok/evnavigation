@@ -154,7 +154,7 @@ docker-build: ## Собрать образ приложения
 
 .PHONY: up
 up: ## Поднять всё (БД + приложение) одной командой
-	docker compose up --build -d
+	docker compose up --build -d --wait
 
 .PHONY: down
 down: ## Остановить контейнеры (данные БД сохраняются)

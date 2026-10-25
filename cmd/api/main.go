@@ -74,6 +74,7 @@ func main() {
 	router := handler.NewRouter(handler.Handlers{
 		Auth:     handler.NewAuthHandler(authService, logger),
 		Vehicles: handler.NewVehicleHandler(vehicleService, logger),
+		Stations: handler.NewStationHandler(stationService, logger),
 		Routes:   handler.NewRoutesHandler(routingService, vehicleService, logger),
 		Tokens:   authService,
 	})

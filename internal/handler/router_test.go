@@ -22,6 +22,7 @@ func newTestRouter() http.Handler {
 	return NewRouter(Handlers{
 		Auth:     NewAuthHandler(&fakeAuth{}, nil),
 		Vehicles: NewVehicleHandler(&fakeVehicleService{}, nil),
+		Stations: NewStationHandler(&fakeStationFinder{stations: manyStations(2)}, nil),
 		Routes:   NewRoutesHandler(&fakePlanner{plan: samplePlan()}, vehicles, nil),
 		Tokens:   fakeTokens{},
 	})
@@ -44,6 +45,7 @@ func TestRouter_PublicEndpointsNeedNoToken(t *testing.T) {
 	}{
 		{http.MethodGet, "/healthz", "", http.StatusOK},
 		{http.MethodGet, "/ev-models", "", http.StatusOK},
+		{http.MethodGet, "/stations/nearby?lat=53.9&lon=27.5", "", http.StatusOK},
 		{http.MethodPost, "/auth/register", `{"name":"Ivan","email":"i@x.io","password":"password123"}`, http.StatusCreated},
 		{http.MethodPost, "/auth/login", `{"email":"i@x.io","password":"password123"}`, http.StatusOK},
 	}

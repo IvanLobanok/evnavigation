@@ -14,6 +14,7 @@ const requestTimeout = 30 * time.Second
 type Handlers struct {
 	Auth     *AuthHandler
 	Vehicles *VehicleHandler
+	Stations *StationHandler
 	Routes   *RoutesHandler
 	Tokens   TokenParser // для middleware Authenticate
 }
@@ -33,6 +34,7 @@ func NewRouter(h Handlers) http.Handler {
 	r.Post("/auth/register", h.Auth.Register)
 	r.Post("/auth/login", h.Auth.Login)
 	r.Get("/ev-models", h.Vehicles.ListModels)
+	r.Get("/stations/nearby", h.Stations.Nearby)
 
 	// эндпоинты, требующие JWT
 	r.Group(func(r chi.Router) {

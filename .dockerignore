@@ -1,0 +1,26 @@
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+
+bin
+dist
+coverage.out
+coverage.html
+*.prof
+*.test
+
+# секреты не должны попадать в образ
+.env
+.env.local
+*.pem
+*.key
+*.crt
+*.csr
+certs
+
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md

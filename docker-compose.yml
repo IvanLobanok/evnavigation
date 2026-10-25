@@ -27,11 +27,19 @@ services:
       DB_NAME: evnavigation
       DB_SSLMODE: disable
       SERVER_PORT: 8080
-      JWT_SECRET: dev-secret-change-me
+      # секрет и срок токена можно переопределить в .env, не трогая этот файл
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      JWT_TTL: ${JWT_TTL:-24h}
       CRITICAL_CHARGE_PERCENT: 15
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
 volumes:
   pgdata:
