@@ -9,6 +9,8 @@ require (
 	golang.org/x/crypto v0.58.0
 )
 
+require github.com/stretchr/testify v1.12.1 // indirect
+
 require (
 	github.com/go-chi/chi/v5 v5.5.0 // direct
 	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
