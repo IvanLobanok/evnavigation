@@ -31,7 +31,7 @@ func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon float64, r
 	var stations []station.ChargingStation
 
 	for rows.Next() {
-		s, err := r.scanStantion(rows)
+		s, err := r.scanStation(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -45,7 +45,7 @@ func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon float64, r
 	return stations, nil
 }
 
-func (r *Repository) scanStantion(row pgx.Row) (*station.ChargingStation, error) {
+func (r *Repository) scanStation(row pgx.Row) (*station.ChargingStation, error) {
 	var s station.ChargingStation
 	err := row.Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.PowerKW, &s.ConnectorTypes, &s.IsOperational)
 	if err != nil {
