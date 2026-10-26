@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
+	"github.com/IvanLobanok/evnavigation/internal/models/history"
+	"github.com/IvanLobanok/evnavigation/internal/models/route"
 	"github.com/IvanLobanok/evnavigation/internal/models/user"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -397,5 +399,166 @@ func TestStations_InactiveStationsAreHidden(t *testing.T) {
 		if s.ID == inactiveID {
 			t.Fatal("a non-operational station must not be returned")
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// История запросов маршрутов
+// ---------------------------------------------------------------------------
+
+func sampleRouteRequest(userID, vehicleID int, status string, km *float64) history.RouteRequest {
+	return history.RouteRequest{
+		UserID:               userID,
+		VehicleID:            vehicleID,
+		From:                 route.RoutePoint{Lat: 53.900612, Lon: 27.559034},
+		To:                   route.RoutePoint{Lat: 53.683299, Lon: 27.133301},
+		InitialChargePercent: 17.5,
+		Status:               status,
+		StopsCount:           1,
+		TotalDistanceKm:      km,
+	}
+}
+
+func userWithVehicle(t *testing.T, r *Repository, pool *pgxpool.Pool, tag string) (userID, vehicleID int) {
+	t.Helper()
+	userID = createTestUser(t, r, pool, tag)
+	v, err := r.CreateVehicle(context.Background(), userID, firstModelID(t, r), nil)
+	if err != nil {
+		t.Fatalf("create vehicle: %v", err)
+	}
+	return userID, v.ID
+}
+
+func TestRouteRequests_CreateAndList(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	uid, vid := userWithVehicle(t, r, pool, "hist")
+
+	km := 36.96
+	id, err := r.CreateRouteRequest(ctx, sampleRouteRequest(uid, vid, history.StatusOK, &km))
+	if err != nil || id <= 0 {
+		t.Fatalf("create: id=%d err=%v", id, err)
+	}
+
+	list, err := r.ListRouteRequests(ctx, uid, 10, 0)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: n=%d err=%v", len(list), err)
+	}
+
+	got := list[0]
+	if got.ID != id || got.UserID != uid || got.VehicleID != vid {
+		t.Errorf("ids: %+v", got)
+	}
+	// координаты хранятся как NUMERIC(9,6): шесть знаков после запятой сохраняются точно
+	if got.From != (route.RoutePoint{Lat: 53.900612, Lon: 27.559034}) || got.To != (route.RoutePoint{Lat: 53.683299, Lon: 27.133301}) {
+		t.Errorf("coordinates: from=%+v to=%+v", got.From, got.To)
+	}
+	if got.InitialChargePercent != 17.5 || got.Status != history.StatusOK || got.StopsCount != 1 {
+		t.Errorf("fields: %+v", got)
+	}
+	if got.TotalDistanceKm == nil || *got.TotalDistanceKm != 36.96 {
+		t.Errorf("distance: %v", got.TotalDistanceKm)
+	}
+	if got.CreatedAt.IsZero() {
+		t.Error("created_at must be filled by the database")
+	}
+}
+
+func TestRouteRequests_NullDistance(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	uid, vid := userWithVehicle(t, r, pool, "histnull")
+
+	if _, err := r.CreateRouteRequest(ctx, sampleRouteRequest(uid, vid, history.StatusNoStationNearby, nil)); err != nil {
+		t.Fatal(err)
+	}
+	list, err := r.ListRouteRequests(ctx, uid, 10, 0)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: n=%d err=%v", len(list), err)
+	}
+	if list[0].TotalDistanceKm != nil || list[0].Status != history.StatusNoStationNearby {
+		t.Errorf("unbuilt route: %+v", list[0])
+	}
+}
+
+func TestRouteRequests_NewestFirstAndKeysetPagination(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	uid, vid := userWithVehicle(t, r, pool, "histpage")
+
+	var ids []int
+	for i := 0; i < 5; i++ {
+		id, err := r.CreateRouteRequest(ctx, sampleRouteRequest(uid, vid, history.StatusOK, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	newest := ids[len(ids)-1]
+
+	page1, err := r.ListRouteRequests(ctx, uid, 2, 0)
+	if err != nil || len(page1) != 2 || page1[0].ID != newest || page1[1].ID != ids[3] {
+		t.Fatalf("page 1: %+v err=%v", page1, err)
+	}
+	page2, err := r.ListRouteRequests(ctx, uid, 2, int64(page1[1].ID))
+	if err != nil || len(page2) != 2 || page2[0].ID != ids[2] || page2[1].ID != ids[1] {
+		t.Fatalf("page 2: %+v err=%v", page2, err)
+	}
+	page3, err := r.ListRouteRequests(ctx, uid, 2, int64(page2[1].ID))
+	if err != nil || len(page3) != 1 || page3[0].ID != ids[0] {
+		t.Fatalf("page 3: %+v err=%v", page3, err)
+	}
+	// курсор строго «меньше»: сама запись-курсор в следующую страницу не попадает
+	if rest, err := r.ListRouteRequests(ctx, uid, 2, int64(ids[0])); err != nil || len(rest) != 0 {
+		t.Errorf("after the oldest record there must be nothing: n=%d err=%v", len(rest), err)
+	}
+}
+
+func TestRouteRequests_UsersSeeOnlyTheirOwn(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	aliceID, aliceCar := userWithVehicle(t, r, pool, "alice")
+	bobID, bobCar := userWithVehicle(t, r, pool, "bob")
+
+	if _, err := r.CreateRouteRequest(ctx, sampleRouteRequest(aliceID, aliceCar, history.StatusOK, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CreateRouteRequest(ctx, sampleRouteRequest(bobID, bobCar, history.StatusOK, nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, uid := range []int{aliceID, bobID} {
+		list, err := r.ListRouteRequests(ctx, uid, 10, 0)
+		if err != nil || len(list) != 1 || list[0].UserID != uid {
+			t.Errorf("user %d must see exactly their own request: %+v err=%v", uid, list, err)
+		}
+	}
+}
+
+func TestRouteRequests_DeletingUserRemovesTheirHistory(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	uid, vid := userWithVehicle(t, r, pool, "histdel")
+
+	id, err := r.CreateRouteRequest(ctx, sampleRouteRequest(uid, vid, history.StatusOK, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, uid); err != nil {
+		t.Fatalf("deleting a user with history must not be blocked by foreign keys: %v", err)
+	}
+
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM route_requests WHERE id = $1`, id).Scan(&n); err != nil || n != 0 {
+		t.Errorf("history must go with its owner: n=%d err=%v", n, err)
+	}
+}
+
+func TestRouteRequests_UnknownVehicleIsRejected(t *testing.T) {
+	r, pool := newTestRepo(t)
+	uid := createTestUser(t, r, pool, "histfk")
+
+	if _, err := r.CreateRouteRequest(context.Background(), sampleRouteRequest(uid, 2_000_000_000, history.StatusOK, nil)); err == nil {
+		t.Fatal("a request for a non-existent vehicle must be rejected by the foreign key")
 	}
 }

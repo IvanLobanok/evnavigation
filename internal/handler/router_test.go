@@ -23,7 +23,8 @@ func newTestRouter() http.Handler {
 		Auth:     NewAuthHandler(&fakeAuth{}, nil),
 		Vehicles: NewVehicleHandler(&fakeVehicleService{}, nil),
 		Stations: NewStationHandler(&fakeStationFinder{stations: manyStations(2)}, nil),
-		Routes:   NewRoutesHandler(&fakePlanner{plan: samplePlan()}, vehicles, nil),
+		Routes:   NewRoutesHandler(&fakePlanner{plan: samplePlan()}, vehicles, &fakeRecorder{}, nil),
+		History:  NewHistoryHandler(&fakeHistory{}, nil),
 		Tokens:   fakeTokens{},
 	})
 }
@@ -61,6 +62,7 @@ func TestRouter_PublicEndpointsNeedNoToken(t *testing.T) {
 func TestRouter_ProtectedEndpointsRejectAnonymous(t *testing.T) {
 	tests := []struct{ method, path, body string }{
 		{http.MethodPost, "/routes", validBody},
+		{http.MethodGet, "/routes/history", ""},
 		{http.MethodPost, "/vehicles", `{"ev_model_id":1}`},
 		{http.MethodGet, "/vehicles", ""},
 		{http.MethodGet, "/vehicles/1", ""},
@@ -89,6 +91,7 @@ func TestRouter_ProtectedEndpointsWorkWithToken(t *testing.T) {
 		want               int
 	}{
 		{http.MethodPost, "/routes", validBody, http.StatusOK},
+		{http.MethodGet, "/routes/history", "", http.StatusOK},
 		{http.MethodGet, "/vehicles", "", http.StatusOK},
 		{http.MethodGet, "/vehicles/7", "", http.StatusOK},
 		{http.MethodPost, "/vehicles", `{"ev_model_id":3}`, http.StatusCreated},

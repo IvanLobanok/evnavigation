@@ -17,6 +17,14 @@ type Config struct {
 	JWTSecret   string
 	JWTTTL      time.Duration
 
+	// провайдер маршрутов: "mock" (по умолчанию) или "yandex" (пока не реализован)
+	RouteProvider string
+	YandexAPIKey  string
+
+	// кэш ответов провайдера; пустой RedisURL — кэш выключен
+	RedisURL      string
+	RouteCacheTTL time.Duration
+
 	Routing routing.Config
 }
 
@@ -45,6 +53,12 @@ func Load() (*Config, error) {
 		DatabaseURL: databaseURL,
 		JWTSecret:   getEnv("JWT_SECRET", "dev_secret_change_me"),
 		JWTTTL:      r.duration("JWT_TTL", 24*time.Hour),
+
+		RouteProvider: getEnv("ROUTE_PROVIDER", "mock"),
+		YandexAPIKey:  getEnv("YANDEX_API_KEY", ""),
+		RedisURL:      getEnv("REDIS_URL", ""),
+		RouteCacheTTL: r.duration("ROUTE_CACHE_TTL", 30*time.Minute),
+
 		Routing: routing.Config{
 			CriticalChargePercent: r.float("CRITICAL_CHARGE_PERCENT", 15),
 			MinArrivalPercent:     r.float("MIN_ARRIVAL_PERCENT", 5),
@@ -61,6 +75,15 @@ func Load() (*Config, error) {
 	}
 	if cfg.JWTTTL <= 0 {
 		return nil, errors.New("invalid configuration: JWT_TTL must be positive")
+	}
+	if cfg.RouteProvider != "mock" && cfg.RouteProvider != "yandex" {
+		return nil, fmt.Errorf("invalid configuration: ROUTE_PROVIDER=%q, expected mock or yandex", cfg.RouteProvider)
+	}
+	if cfg.RouteProvider == "yandex" && cfg.YandexAPIKey == "" {
+		return nil, errors.New("invalid configuration: YANDEX_API_KEY is required when ROUTE_PROVIDER=yandex")
+	}
+	if cfg.RouteCacheTTL <= 0 {
+		return nil, errors.New("invalid configuration: ROUTE_CACHE_TTL must be positive")
 	}
 	if cfg.AppEnv == "production" && len(cfg.JWTSecret) < minProductionSecretLen {
 		return nil, fmt.Errorf("invalid configuration: JWT_SECRET must be at least %d characters when APP_ENV=production", minProductionSecretLen)
@@ -116,8 +139,10 @@ func (r *envReader) err() error {
 	return errors.Join(r.errs...)
 }
 
+// getEnv возвращает значение переменной окружения; пустое значение (VAR=) считается незаданным.
+// Иначе, например, DB_PORT= дал бы DSN вида postgres://...@localhost:/db, который не разобрать.
 func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists {
+	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return fallback

@@ -16,6 +16,7 @@ type Handlers struct {
 	Vehicles *VehicleHandler
 	Stations *StationHandler
 	Routes   *RoutesHandler
+	History  *HistoryHandler
 	Tokens   TokenParser // для middleware Authenticate
 }
 
@@ -45,6 +46,7 @@ func NewRouter(h Handlers) http.Handler {
 		r.Get("/vehicles/{id}", h.Vehicles.Get)
 
 		r.Post("/routes", h.Routes.PlanRoute)
+		r.Get("/routes/history", h.History.List)
 	})
 
 	return r

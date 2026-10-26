@@ -5,8 +5,10 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
+	"github.com/IvanLobanok/evnavigation/internal/models/history"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
 	"github.com/IvanLobanok/evnavigation/internal/models/user"
 	"github.com/IvanLobanok/evnavigation/internal/service/routing"
@@ -22,19 +24,26 @@ type VehicleResolver interface {
 	GetVehicle(ctx context.Context, userID, vehicleID int) (*user.VehicleDetails, error)
 }
 
+// RequestRecorder сохраняет историю запросов маршрута (реализует history.Service).
+type RequestRecorder interface {
+	Record(ctx context.Context, rr history.RouteRequest) error
+}
+
 type RoutesHandler struct {
 	planner  RoutePlanner
 	vehicles VehicleResolver
+	recorder RequestRecorder
 	log      *slog.Logger
 }
 
-func NewRoutesHandler(planner RoutePlanner, vehicles VehicleResolver, log *slog.Logger) *RoutesHandler {
+func NewRoutesHandler(planner RoutePlanner, vehicles VehicleResolver, recorder RequestRecorder, log *slog.Logger) *RoutesHandler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &RoutesHandler{
 		planner:  planner,
 		vehicles: vehicles,
+		recorder: recorder,
 		log:      log,
 	}
 }
@@ -207,6 +216,7 @@ func (h *RoutesHandler) PlanRoute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	plan, err := h.planner.PlanRoute(r.Context(), v.from, v.to, d.EVModel, v.chargePercent)
+	h.recordRequest(r, userID, v, plan, err)
 	if err != nil {
 		h.writePlanError(w, r, plan, err)
 		return
@@ -220,16 +230,24 @@ func (h *RoutesHandler) PlanRoute(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (h *RoutesHandler) writePlanError(w http.ResponseWriter, r *http.Request, plan *routing.RoutePlan, err error) {
-	var code, message string
+// classifyPlanError сопоставляет ошибку планировщика с кодом API.
+// Для известных ошибок маршрута (422) ok == true; всё остальное — внутренний сбой.
+func classifyPlanError(err error) (code, message string, ok bool) {
 	switch {
 	case errors.Is(err, routing.ErrNoStationNearby):
-		code, message = "no_station_nearby", "no compatible charging station found before the battery runs low"
+		return history.StatusNoStationNearby, "no compatible charging station found before the battery runs low", true
 	case errors.Is(err, routing.ErrStationUnreachable):
-		code, message = "station_unreachable", "charging stations exist nearby but cannot be reached with the remaining charge"
+		return history.StatusStationUnreachable, "charging stations exist nearby but cannot be reached with the remaining charge", true
 	case errors.Is(err, routing.ErrTooManyStops):
-		code, message = "too_many_stops", "the route requires more charging stops than allowed"
+		return history.StatusTooManyStops, "the route requires more charging stops than allowed", true
 	default:
+		return "", "", false
+	}
+}
+
+func (h *RoutesHandler) writePlanError(w http.ResponseWriter, r *http.Request, plan *routing.RoutePlan, err error) {
+	code, message, known := classifyPlanError(err)
+	if !known {
 		internalError(w, r, h.log, "plan route", err)
 		return
 	}
@@ -240,4 +258,36 @@ func (h *RoutesHandler) writePlanError(w http.ResponseWriter, r *http.Request, p
 		resp.PartialPlan = &partial
 	}
 	writeJSON(w, http.StatusUnprocessableEntity, resp)
+}
+
+// recordRequest сохраняет запрос в историю. Это best-effort: сбой записи не должен ломать ответ клиенту,
+// поэтому ошибка только логируется. Запись идёт отдельным контекстом без отмены: если клиент оборвал
+// соединение, пока считался маршрут, сам факт запроса всё равно стоит сохранить.
+func (h *RoutesHandler) recordRequest(r *http.Request, userID int, v validatedRequest, plan *routing.RoutePlan, planErr error) {
+	rr := history.RouteRequest{
+		UserID:               userID,
+		VehicleID:            v.vehicleID,
+		From:                 v.from,
+		To:                   v.to,
+		InitialChargePercent: v.chargePercent,
+		Status:               history.StatusOK,
+	}
+	if plan != nil {
+		rr.StopsCount = len(plan.Stops)
+	}
+	if planErr != nil {
+		rr.Status = history.StatusError
+		if code, _, known := classifyPlanError(planErr); known {
+			rr.Status = code
+		}
+	} else if plan != nil {
+		km := round2(plan.TotalDistanceKm)
+		rr.TotalDistanceKm = &km
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+	defer cancel()
+	if err := h.recorder.Record(ctx, rr); err != nil {
+		h.log.Error("failed to record route request", "user_id", userID, "status", rr.Status, "error", err)
+	}
 }

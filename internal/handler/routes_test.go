@@ -67,7 +67,7 @@ const validBody = `{
 }`
 
 func newHandler(p *fakePlanner, v *fakeVehicles) *RoutesHandler {
-	return NewRoutesHandler(p, v, nil)
+	return NewRoutesHandler(p, v, &fakeRecorder{}, nil)
 }
 
 func post(h *RoutesHandler, body string) *httptest.ResponseRecorder {
