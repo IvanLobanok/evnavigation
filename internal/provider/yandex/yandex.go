@@ -20,9 +20,8 @@ type Config struct {
 	APIKey string
 }
 
-type Provider struct {
-	cfg Config
-}
+// Provider пока без полей: HTTP-клиент и ключ появятся вместе с реализацией BuildRoute.
+type Provider struct{}
 
 var _ route.RouteProvider = (*Provider)(nil)
 

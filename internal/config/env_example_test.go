@@ -22,7 +22,7 @@ func readEnvExample(t *testing.T) map[string]string {
 	if err != nil {
 		t.Fatalf("open %s: %v", envExamplePath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	vars := map[string]string{}
 	sc := bufio.NewScanner(f)

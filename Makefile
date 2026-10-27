@@ -176,8 +176,7 @@ docker-reset: ## УДАЛИТЬ контейнеры вместе с данны�
 
 .PHONY: smoke
 smoke: ## Сквозная проверка API: регистрация -> логин -> машина -> маршрут (scripts/smoke.sh)
-	@API_URL=$(API_URL) ./scripts/smoke.sh
-
+	@API_URL=$(API_URL) bash ./scripts/smoke.sh
 ##@ Прочее
 
 .PHONY: tools
