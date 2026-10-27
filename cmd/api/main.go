@@ -14,9 +14,9 @@ import (
 	"github.com/IvanLobanok/evnavigation/internal/config"
 	"github.com/IvanLobanok/evnavigation/internal/handler"
 	"github.com/IvanLobanok/evnavigation/internal/migrate"
-	"github.com/IvanLobanok/evnavigation/internal/provider/mock"
 	"github.com/IvanLobanok/evnavigation/internal/repository/postgres"
 	"github.com/IvanLobanok/evnavigation/internal/service/auth"
+	historysvc "github.com/IvanLobanok/evnavigation/internal/service/history"
 	"github.com/IvanLobanok/evnavigation/internal/service/routing"
 	stationsvc "github.com/IvanLobanok/evnavigation/internal/service/station"
 	"github.com/IvanLobanok/evnavigation/internal/service/vehicle"
@@ -54,6 +54,7 @@ func main() {
 	repo := postgres.NewRepository(dbPool)
 	stationService := stationsvc.NewService(repo)
 	vehicleService := vehicle.NewService(repo, repo)
+	historyService := historysvc.NewService(repo)
 
 	authService, err := auth.NewService(repo, auth.Config{
 		Secret: []byte(cfg.JWTSecret),
@@ -63,19 +64,27 @@ func main() {
 		log.Fatalf("failed to create auth service: %v", err)
 	}
 
-	// пока MockProvider; когда появится ключ Яндекса, заменится на YandexProvider
-	routingService, err := routing.NewService(&mock.MockProvider{}, stationService, cfg.Routing)
+	logger := slog.Default()
+
+	// провайдер маршрутов выбирается конфигурацией (ROUTE_PROVIDER) и при заданном REDIS_URL кэшируется
+	routeProvider, closeRouteProvider, err := newRouteProvider(ctx, cfg, logger)
+	if err != nil {
+		log.Fatalf("failed to create route provider: %v", err)
+	}
+	defer closeRouteProvider()
+
+	routingService, err := routing.NewService(routeProvider, stationService, cfg.Routing)
 	if err != nil {
 		log.Fatalf("failed to create routing service: %v", err)
 	}
 
 	// сервисы -> хендлеры -> роутер
-	logger := slog.Default()
 	router := handler.NewRouter(handler.Handlers{
 		Auth:     handler.NewAuthHandler(authService, logger),
 		Vehicles: handler.NewVehicleHandler(vehicleService, logger),
 		Stations: handler.NewStationHandler(stationService, logger),
-		Routes:   handler.NewRoutesHandler(routingService, vehicleService, logger),
+		Routes:   handler.NewRoutesHandler(routingService, vehicleService, historyService, logger),
+		History:  handler.NewHistoryHandler(historyService, logger),
 		Tokens:   authService,
 	})
 

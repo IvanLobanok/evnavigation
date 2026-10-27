@@ -9,10 +9,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const evmodelColumns = `id, brand,model,battery_capacity_kwh, avg_consumption_kwh_100km, connector_type, max_charging_power_kw `
+const evmodelColumns = ` id, brand,model,battery_capacity_kwh, avg_consumption_kwh_100km, connector_type, max_charging_power_kw `
 
 func (r *Repository) GetAllEVModels(ctx context.Context) ([]evmodel.EVModel, error) {
-	query := `SELECT ` + evmodelColumns + `FROM ev_models ORDER BY brand, model;`
+	query := `SELECT` + evmodelColumns + `FROM ev_models ORDER BY brand, model;`
 
 	rows, err := r.db.Query(ctx, query)
 	if err != nil {

@@ -6,7 +6,7 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("user not found")
+	ErrNotFound = errors.New("station not found")
 )
 
 type ChargingStation struct {

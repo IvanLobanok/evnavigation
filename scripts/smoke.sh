@@ -64,4 +64,11 @@ echo "      $(echo "$BODY" | grep -o '"stops":\[[^]]*\]' | head -c 80)"
 call POST /routes 200 "{\"from\":{\"lat\":53.82,\"lon\":27.35},\"to\":{\"lat\":53.95,\"lon\":27.70},\"vehicle_id\":$VEHICLE_ID,\"current_charge_percent\":17}" "$TOKEN"
 echo "      $(echo "$BODY" | grep -o '"stops":\[{[^}]*}' | head -c 120)..."
 
+# история: оба только что построенных маршрута записаны (запись идёт синхронно, до ответа клиенту)
+call GET  "/routes/history?limit=5" 200 "" "$TOKEN"
+OK_COUNT=$(echo "$BODY" | grep -o '"status":"ok"' | wc -l | tr -d ' ')
+[[ "$OK_COUNT" == "2" ]] || { echo "FAIL  в истории $OK_COUNT успешных маршрутов, ожидали 2"; echo "      $BODY"; exit 1; }
+echo "      в истории 2 маршрута со статусом ok"
+call GET  "/routes/history" 401              # чужому/анониму история не отдаётся
+
 echo "smoke: всё хорошо"

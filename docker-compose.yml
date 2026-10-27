@@ -15,6 +15,18 @@ services:
       timeout: 5s
       retries: 5
 
+  # кэш ответов провайдера маршрутов: только оперативная память, без сохранения на диск
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   app:
     build: .
     ports:
@@ -31,8 +43,13 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
       JWT_TTL: ${JWT_TTL:-24h}
       CRITICAL_CHARGE_PERCENT: 15
+      ROUTE_PROVIDER: ${ROUTE_PROVIDER:-mock}
+      REDIS_URL: redis://redis:6379/0
+      ROUTE_CACHE_TTL: ${ROUTE_CACHE_TTL:-30m}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]

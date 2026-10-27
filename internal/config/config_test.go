@@ -158,3 +158,126 @@ func TestLoad_ProductionRequiresStrongSecret(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_ProviderAndCacheDefaults(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RouteProvider != "mock" {
+		t.Errorf("RouteProvider: got %q, want mock", cfg.RouteProvider)
+	}
+	if cfg.RedisURL != "" {
+		t.Errorf("the cache must be off by default, got REDIS_URL=%q", cfg.RedisURL)
+	}
+	if cfg.RouteCacheTTL != 30*time.Minute {
+		t.Errorf("RouteCacheTTL: got %v, want 30m", cfg.RouteCacheTTL)
+	}
+}
+
+func TestLoad_RouteProvider(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		apiKey   string
+		want     string
+		wantErr  bool
+	}{
+		{"mock", "mock", "", "mock", false},
+		{"empty value falls back to mock", "", "", "mock", false},
+		{"yandex with a key", "yandex", "secret-key", "yandex", false},
+		{"yandex without a key", "yandex", "", "", true},
+		{"unknown provider", "google", "", "", true},
+		{"case matters", "Mock", "", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ROUTE_PROVIDER", tc.provider)
+			t.Setenv("YANDEX_API_KEY", tc.apiKey)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got provider=%q", cfg.RouteProvider)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.RouteProvider != tc.want {
+				t.Errorf("got %q, want %q", cfg.RouteProvider, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_RedisSettings(t *testing.T) {
+	t.Setenv("REDIS_URL", "redis://redis:6379/0")
+	t.Setenv("ROUTE_CACHE_TTL", "5m")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RedisURL != "redis://redis:6379/0" || cfg.RouteCacheTTL != 5*time.Minute {
+		t.Errorf("got url=%q ttl=%v", cfg.RedisURL, cfg.RouteCacheTTL)
+	}
+}
+
+func TestLoad_RouteCacheTTLValidation(t *testing.T) {
+	for _, v := range []string{"0s", "-5m", "soon", "300"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("ROUTE_CACHE_TTL", v)
+
+			if _, err := Load(); err == nil {
+				t.Errorf("ROUTE_CACHE_TTL=%q must be rejected", v)
+			}
+		})
+	}
+}
+
+func TestLoad_EmptyVariablesAreTreatedAsUnset(t *testing.T) {
+	// так выглядят `VAR=` в .env и `${VAR:-}` в docker-compose
+	for _, k := range []string{"DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME", "DB_SSLMODE", "SERVER_PORT", "APP_ENV", "JWT_SECRET", "ROUTE_PROVIDER"} {
+		t.Setenv(k, "")
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if want := "postgres://postgres:evnav_dev_pass@localhost:5432/evnavigation?sslmode=disable"; cfg.DatabaseURL != want {
+		t.Errorf("DatabaseURL:\n got  %s\n want %s", cfg.DatabaseURL, want)
+	}
+	if cfg.ServerPort != "8080" || cfg.AppEnv != "development" || cfg.RouteProvider != "mock" || cfg.JWTSecret != "dev_secret_change_me" {
+		t.Errorf("empty variables must fall back to the defaults: %+v", cfg)
+	}
+}
+
+func TestLoad_DatabaseURLFromVariables(t *testing.T) {
+	t.Setenv("DB_HOST", "db.internal")
+	t.Setenv("DB_PORT", "5433")
+	t.Setenv("DB_USER", "app")
+	t.Setenv("DB_PASSWORD", "s3cret")
+	t.Setenv("DB_NAME", "evnav")
+	t.Setenv("DB_SSLMODE", "require")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "postgres://app:s3cret@db.internal:5433/evnav?sslmode=require"; cfg.DatabaseURL != want {
+		t.Errorf("got %s, want %s", cfg.DatabaseURL, want)
+	}
+}
+
+func TestLoad_ProductionWithEmptySecretIsRejected(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("JWT_SECRET", "") // пустой секрет не должен молча превращаться в «достаточно длинный» дефолт
+
+	if _, err := Load(); err == nil {
+		t.Fatal("an empty secret in production must be rejected")
+	}
+}
