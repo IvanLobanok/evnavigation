@@ -11,7 +11,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/bin/evnav-api ./cmd/api
 
-FROM alpine:3.20
+FROM alpine:3.24
 
 # ca-certificates понадобятся для HTTPS-запросов к Яндекс.Router
 RUN apk add --no-cache ca-certificates \
