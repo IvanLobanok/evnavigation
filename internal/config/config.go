@@ -26,6 +26,20 @@ type Config struct {
 	RouteCacheTTL time.Duration
 
 	Routing routing.Config
+
+	// --- защита от перегрузки ---
+	DBMaxConns                  int // размер пула соединений с PostgreSQL; 0 - по умолчанию pgx (max(4, число CPU))
+	RouteProviderMaxConcurrency int // одновременных вызовов провайдера маршрутов; 0 - без ограничения
+	BcryptMaxConcurrency        int // одновременных bcrypt-операций; 0 - runtime.GOMAXPROCS
+
+	// ограничения частоты запросов; 0 запросов в минуту выключает соответствующее ограничение
+	RateLimitAuthPerMin   int
+	RateLimitAuthBurst    int
+	RateLimitPublicPerMin int
+	RateLimitPublicBurst  int
+	RateLimitRoutesPerMin int
+	RateLimitRoutesBurst  int
+	TrustProxyHeaders     bool // IP клиента брать из X-Forwarded-For (только за своим прокси)
 }
 
 type envReader struct {
@@ -68,7 +82,20 @@ func Load() (*Config, error) {
 			MaxStationCandidates:  r.int("MAX_STATION_CANDIDATES", 3),
 			LookbackStepKm:        r.float("LOOKBACK_STEP_KM", 5),
 			MaxLookbackKm:         r.float("MAX_LOOKBACK_KM", 30),
+			CandidateParallelism:  r.int("ROUTE_CANDIDATE_PARALLELISM", 1),
 		},
+
+		DBMaxConns:                  r.int("DB_MAX_CONNS", 0),
+		RouteProviderMaxConcurrency: r.int("ROUTE_PROVIDER_MAX_CONCURRENCY", 32),
+		BcryptMaxConcurrency:        r.int("BCRYPT_MAX_CONCURRENCY", 0),
+
+		RateLimitAuthPerMin:   r.int("RATE_LIMIT_AUTH_PER_MIN", 30),
+		RateLimitAuthBurst:    r.int("RATE_LIMIT_AUTH_BURST", 10),
+		RateLimitPublicPerMin: r.int("RATE_LIMIT_PUBLIC_PER_MIN", 300),
+		RateLimitPublicBurst:  r.int("RATE_LIMIT_PUBLIC_BURST", 60),
+		RateLimitRoutesPerMin: r.int("RATE_LIMIT_ROUTES_PER_MIN", 60),
+		RateLimitRoutesBurst:  r.int("RATE_LIMIT_ROUTES_BURST", 10),
+		TrustProxyHeaders:     r.bool("TRUST_PROXY_HEADERS", false),
 	}
 	if err := r.err(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -85,6 +112,9 @@ func Load() (*Config, error) {
 	if cfg.RouteCacheTTL <= 0 {
 		return nil, errors.New("invalid configuration: ROUTE_CACHE_TTL must be positive")
 	}
+	if err := cfg.validateLimits(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
 	if cfg.AppEnv == "production" && len(cfg.JWTSecret) < minProductionSecretLen {
 		return nil, fmt.Errorf("invalid configuration: JWT_SECRET must be at least %d characters when APP_ENV=production", minProductionSecretLen)
 	}
@@ -93,6 +123,38 @@ func Load() (*Config, error) {
 }
 
 const minProductionSecretLen = 32
+
+// validateLimits: отрицательные значения бессмысленны, а включённому ограничению нужно ведро хотя бы на один запрос.
+func (c *Config) validateLimits() error {
+	var errs []error
+	nonNegative := map[string]int{
+		"DB_MAX_CONNS":                   c.DBMaxConns,
+		"ROUTE_PROVIDER_MAX_CONCURRENCY": c.RouteProviderMaxConcurrency,
+		"BCRYPT_MAX_CONCURRENCY":         c.BcryptMaxConcurrency,
+		"ROUTE_CANDIDATE_PARALLELISM":    c.Routing.CandidateParallelism,
+		"RATE_LIMIT_AUTH_PER_MIN":        c.RateLimitAuthPerMin,
+		"RATE_LIMIT_PUBLIC_PER_MIN":      c.RateLimitPublicPerMin,
+		"RATE_LIMIT_ROUTES_PER_MIN":      c.RateLimitRoutesPerMin,
+	}
+	for name, v := range nonNegative {
+		if v < 0 {
+			errs = append(errs, fmt.Errorf("%s must not be negative, got %d", name, v))
+		}
+	}
+	for _, l := range []struct {
+		perMin, burst int
+		burstName     string
+	}{
+		{c.RateLimitAuthPerMin, c.RateLimitAuthBurst, "RATE_LIMIT_AUTH_BURST"},
+		{c.RateLimitPublicPerMin, c.RateLimitPublicBurst, "RATE_LIMIT_PUBLIC_BURST"},
+		{c.RateLimitRoutesPerMin, c.RateLimitRoutesBurst, "RATE_LIMIT_ROUTES_BURST"},
+	} {
+		if l.perMin > 0 && l.burst < 1 {
+			errs = append(errs, fmt.Errorf("%s must be at least 1 while the limit is enabled, got %d", l.burstName, l.burst))
+		}
+	}
+	return errors.Join(errs...)
+}
 
 func (r *envReader) float(key string, fallback float64) float64 {
 	raw, ok := os.LookupEnv(key)
@@ -117,6 +179,19 @@ func (r *envReader) int(key string, fallback int) int {
 	v, err := strconv.Atoi(raw)
 	if err != nil {
 		r.errs = append(r.errs, fmt.Errorf("%s=%q: not an integer", key, raw))
+		return fallback
+	}
+	return v
+}
+
+func (r *envReader) bool(key string, fallback bool) bool {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		r.errs = append(r.errs, fmt.Errorf("%s=%q: not a boolean (true or false)", key, raw))
 		return fallback
 	}
 	return v

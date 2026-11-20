@@ -23,6 +23,7 @@ func TestLoad_Defaults(t *testing.T) {
 		MaxStationCandidates:  3,
 		LookbackStepKm:        5,
 		MaxLookbackKm:         30,
+		CandidateParallelism:  1,
 	}
 	if cfg.Routing != want {
 		t.Errorf("routing defaults:\n got  %+v\n want %+v", cfg.Routing, want)
@@ -280,4 +281,77 @@ func TestLoad_ProductionWithEmptySecretIsRejected(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("an empty secret in production must be rejected")
 	}
+}
+
+func TestLoad_OverloadProtectionDefaults(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DBMaxConns != 0 || cfg.BcryptMaxConcurrency != 0 || cfg.RouteProviderMaxConcurrency != 32 {
+		t.Errorf("pool/concurrency defaults: db=%d bcrypt=%d provider=%d", cfg.DBMaxConns, cfg.BcryptMaxConcurrency, cfg.RouteProviderMaxConcurrency)
+	}
+	if cfg.RateLimitAuthPerMin != 30 || cfg.RateLimitAuthBurst != 10 ||
+		cfg.RateLimitPublicPerMin != 300 || cfg.RateLimitPublicBurst != 60 ||
+		cfg.RateLimitRoutesPerMin != 60 || cfg.RateLimitRoutesBurst != 10 {
+		t.Errorf("rate limit defaults: %+v", cfg)
+	}
+	if cfg.TrustProxyHeaders {
+		t.Error("X-Forwarded-For must not be trusted by default: it would let clients forge their IP")
+	}
+}
+
+func TestLoad_OverloadProtectionOverrides(t *testing.T) {
+	t.Setenv("DB_MAX_CONNS", "40")
+	t.Setenv("BCRYPT_MAX_CONCURRENCY", "6")
+	t.Setenv("ROUTE_PROVIDER_MAX_CONCURRENCY", "0")
+	t.Setenv("ROUTE_CANDIDATE_PARALLELISM", "3")
+	t.Setenv("RATE_LIMIT_ROUTES_PER_MIN", "0")
+	t.Setenv("TRUST_PROXY_HEADERS", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DBMaxConns != 40 || cfg.BcryptMaxConcurrency != 6 || cfg.RouteProviderMaxConcurrency != 0 || cfg.Routing.CandidateParallelism != 3 {
+		t.Errorf("overrides were not applied: %+v", cfg)
+	}
+	if cfg.RateLimitRoutesPerMin != 0 || !cfg.TrustProxyHeaders {
+		t.Errorf("rate limit overrides: routes=%d trust=%v", cfg.RateLimitRoutesPerMin, cfg.TrustProxyHeaders)
+	}
+}
+
+func TestLoad_OverloadProtectionValidation(t *testing.T) {
+	tests := []struct {
+		name, key, value, wantInErr string
+	}{
+		{"negative pool", "DB_MAX_CONNS", "-1", "DB_MAX_CONNS"},
+		{"negative provider concurrency", "ROUTE_PROVIDER_MAX_CONCURRENCY", "-5", "ROUTE_PROVIDER_MAX_CONCURRENCY"},
+		{"negative bcrypt concurrency", "BCRYPT_MAX_CONCURRENCY", "-1", "BCRYPT_MAX_CONCURRENCY"},
+		{"negative parallelism", "ROUTE_CANDIDATE_PARALLELISM", "-2", "ROUTE_CANDIDATE_PARALLELISM"},
+		{"negative rate", "RATE_LIMIT_AUTH_PER_MIN", "-10", "RATE_LIMIT_AUTH_PER_MIN"},
+		{"zero burst while the limit is on", "RATE_LIMIT_ROUTES_BURST", "0", "RATE_LIMIT_ROUTES_BURST"},
+		{"not an integer", "RATE_LIMIT_PUBLIC_PER_MIN", "many", "RATE_LIMIT_PUBLIC_PER_MIN"},
+		{"not a boolean", "TRUST_PROXY_HEADERS", "maybe", "TRUST_PROXY_HEADERS"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			cfg, err := Load()
+			if err == nil {
+				t.Fatalf("%s=%s must be rejected, got %+v", tc.key, tc.value, cfg)
+			}
+			if !strings.Contains(err.Error(), tc.wantInErr) {
+				t.Errorf("the error must name %s: %v", tc.wantInErr, err)
+			}
+		})
+	}
+
+	t.Run("zero burst is fine when the limit is off", func(t *testing.T) {
+		t.Setenv("RATE_LIMIT_ROUTES_PER_MIN", "0")
+		t.Setenv("RATE_LIMIT_ROUTES_BURST", "0")
+		if _, err := Load(); err != nil {
+			t.Errorf("a disabled limit needs no burst: %v", err)
+		}
+	})
 }

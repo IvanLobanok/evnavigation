@@ -1,0 +1,2898 @@
+diff --git a/.env.example b/.env.example
+index 3f9d459..dc9a1b6 100644
+--- a/.env.example
++++ b/.env.example
+@@ -48,3 +48,29 @@ MAX_STATION_CANDIDATES=3
+ # шаг и глубина отката назад по маршруту, если у критической точки станции нет, км
+ LOOKBACK_STEP_KM=5
+ MAX_LOOKBACK_KM=30
++# сколько станций-кандидатов проверять одновременно. 1 - по одной (меньше вызовов провайдера),
++# больше - быстрее ответ, но кандидаты шага проверяются сразу все, и вызовов провайдера становится больше
++ROUTE_CANDIDATE_PARALLELISM=1
++
++# --- защита от перегрузки -------------------------------------------------
++# размер пула соединений с PostgreSQL; 0 - по умолчанию pgx: max(4, число CPU).
++# Суммарно по всем репликам приложения не должен превышать max_connections у PostgreSQL
++DB_MAX_CONNS=0
++# одновременных вызовов провайдера маршрутов (общий потолок на внешний API); 0 - без ограничения
++ROUTE_PROVIDER_MAX_CONCURRENCY=32
++# одновременных bcrypt-операций (регистрация, логин); 0 - по числу CPU
++BCRYPT_MAX_CONCURRENCY=0
++# ограничения частоты запросов: запросов в минуту и размер «пачки», которую можно отправить сразу.
++# 0 запросов в минуту - ограничение выключено. Сверх лимита сервер отвечает 429 с Retry-After.
++# по IP: POST /auth/register и /auth/login
++RATE_LIMIT_AUTH_PER_MIN=30
++RATE_LIMIT_AUTH_BURST=10
++# по IP: GET /ev-models и /stations/nearby
++RATE_LIMIT_PUBLIC_PER_MIN=300
++RATE_LIMIT_PUBLIC_BURST=60
++# по пользователю: POST /routes
++RATE_LIMIT_ROUTES_PER_MIN=60
++RATE_LIMIT_ROUTES_BURST=10
++# IP клиента брать из X-Forwarded-For. true - только если перед сервисом стоит свой прокси, который заголовок дописывает;
++# иначе клиент подделает IP и обойдёт лимит. За прокси при false все клиенты делят один IP прокси и один общий лимит
++TRUST_PROXY_HEADERS=false
+diff --git a/README.md b/README.md
+index 4fb340d..4f37905 100644
+--- a/README.md
++++ b/README.md
+@@ -141,10 +141,12 @@ curl -s "localhost:8080/routes/history?limit=5" -H "Authorization: Bearer $TOKEN
+ | 404 | `vehicle_not_found` | нет такой машины среди ваших |
+ | 409 | `email_taken` | email уже зарегистрирован (без учёта регистра) |
+ | 413 | `body_too_large` | тело больше 1 МБ |
++| 429 | `rate_limited` | превышена частота запросов (см. [Защита от перегрузки](#защита-от-перегрузки)); заголовок `Retry-After` говорит, через сколько секунд повторить |
+ | 422 | `no_station_nearby` | в зоне поиска нет совместимых станций |
+ | 422 | `station_unreachable` | станции есть, но до них не хватает заряда |
+ | 422 | `too_many_stops` | маршрут требует больше остановок, чем разрешено |
+ | 500 | `internal_error` | внутренний сбой (подробности только в логе) |
++| 503 | `service_busy` | все слоты хеширования паролей заняты (`/auth/register`, `/auth/login`); с заголовком `Retry-After: 1` |
+ 
+ ## Как строится маршрут
+ 
+@@ -196,6 +198,26 @@ flowchart TD
+ | `MAX_CHARGING_STOPS` | `5` | максимум остановок на маршруте |
+ | `MAX_STATION_CANDIDATES` | `3` | сколько станций проверять за один поиск |
+ | `LOOKBACK_STEP_KM`, `MAX_LOOKBACK_KM` | `5`, `30` | шаг и глубина отката назад по маршруту |
++| `ROUTE_CANDIDATE_PARALLELISM` | `1` | сколько станций-кандидатов проверять одновременно (`1` - по одной) |
++| `DB_MAX_CONNS` | `0` | размер пула соединений с PostgreSQL; `0` - по умолчанию pgx, `max(4, число CPU)` |
++| `ROUTE_PROVIDER_MAX_CONCURRENCY` | `32` | потолок одновременных вызовов провайдера маршрутов; `0` - без ограничения |
++| `BCRYPT_MAX_CONCURRENCY` | `0` | сколько bcrypt-операций одновременно; `0` - по числу CPU |
++| `RATE_LIMIT_AUTH_PER_MIN`, `RATE_LIMIT_AUTH_BURST` | `30`, `10` | запросов в минуту и «пачка» на IP для `/auth/*`; `0` в минуту - без ограничения |
++| `RATE_LIMIT_PUBLIC_PER_MIN`, `RATE_LIMIT_PUBLIC_BURST` | `300`, `60` | то же по IP для `/ev-models` и `/stations/nearby` |
++| `RATE_LIMIT_ROUTES_PER_MIN`, `RATE_LIMIT_ROUTES_BURST` | `60`, `10` | то же по пользователю для `POST /routes` |
++| `TRUST_PROXY_HEADERS` | `false` | брать IP клиента из `X-Forwarded-For` (только за своим прокси) |
++
++### Защита от перегрузки
++
++Узкие места под нагрузкой закрыты так:
++
++- **Ограничение частоты запросов** (429, `Retry-After`): по IP для `/auth/*` (внутри каждого запроса - bcrypt), по IP для публичных `/ev-models` и `/stations/nearby`, по пользователю для `POST /routes` (самый дорогой запрос). Это «токеновое ведро»: можно сразу отправить `BURST` запросов, дальше - `PER_MIN` в минуту. Состояние хранится в памяти процесса, поэтому **при нескольких репликах лимит действует на каждую реплику отдельно**; общий лимит придётся делать на балансировщике или через Redis. IPv6-адреса считаются по сети `/64`.
++- **Если сервис стоит за прокси** (nginx, балансировщик), включите `TRUST_PROXY_HEADERS=true`, и прокси должен дописывать `X-Forwarded-For`; берётся его последнее значение. Без этого все клиенты выглядят как один IP прокси и делят один лимит. С включённым флагом без прокси клиент подделает IP и обойдёт лимит.
++- **bcrypt** выполняется не более `BCRYPT_MAX_CONCURRENCY` операций одновременно (по умолчанию по числу CPU), остальные ждут слот до конца таймаута запроса, после чего клиент получает 503.
++- **Провайдер маршрутов** не получает больше `ROUTE_PROVIDER_MAX_CONCURRENCY` одновременных вызовов. Лимитер стоит под кэшем Redis: попадания в кэш слотов не занимают.
++- **Поиск станций** фильтрует по разъёму и ограничивает число строк в SQL: в плотных районах из базы не приезжают тысячи станций ради трёх кандидатов.
++- **Расчёт маршрута** не обращается к провайдеру за станциями, до которых заведомо не доехать даже по прямой. Кандидатов можно проверять параллельно (`ROUTE_CANDIDATE_PARALLELISM` больше 1): ответ приходит быстрее, но вызовов провайдера становится больше. Выбранная станция от значения не зависит.
++- **Пул соединений** настраивается через `DB_MAX_CONNS`; суммарно по всем репликам он не должен превышать `max_connections` у PostgreSQL.
+ 
+ ## Архитектура
+ 
+@@ -225,7 +247,7 @@ flowchart TD
+ cmd/api/                 точка входа, выбор провайдера маршрутов, graceful shutdown
+ internal/
+   config/                конфигурация из переменных окружения
+-  handler/               HTTP: роутер (chi), middleware авторизации, DTO, коды ошибок
++  handler/               HTTP: роутер (chi), middleware авторизации и ограничения частоты, DTO, коды ошибок
+   service/
+     auth/                регистрация, вход, JWT
+     vehicle/             каталог моделей, машины пользователей
+@@ -235,6 +257,7 @@ internal/
+   provider/
+     mock/                провайдер для разработки: прямая линия по сегментам 5 км
+     cache/               кэширующий декоратор над любым провайдером + Redis
++    limit/               потолок одновременных вызовов провайдера
+     yandex/              заготовка под Яндекс.Router
+   repository/postgres/   запросы к PostgreSQL и PostGIS (pgx, без ORM)
+   models/                сущности и ошибки предметной области
+@@ -288,6 +311,7 @@ GitHub Actions (`.github/workflows/ci.yml`) на каждый push в `main` и
+ - Тела запросов читаются строго: неизвестные поля отклоняются, размер ограничен 1 МБ.
+ - Внутренние ошибки не попадают клиенту: наружу уходит общий текст, подробности пишутся в лог.
+ - В режиме `APP_ENV=production` слабый или дефолтный секрет JWT не даёт запустить приложение.
++- Регистрация и вход ограничены по частоте запросов с одного IP, а число одновременных bcrypt-операций ограничено: перебор паролей и всплеск логинов не съедают процессор (см. [Защита от перегрузки](#защита-от-перегрузки)).
+ - Приложение в Docker работает не от root, а `.dockerignore` не пускает `.env` в образ.
+ 
+ ## Ограничения MVP
+@@ -300,7 +324,7 @@ GitHub Actions (`.github/workflows/ci.yml`) на каждый push в `main` и
+ - **Зарядка мгновенная:** время и мощность станции в расчёте не участвуют, заряжаемся до фиксированных 80%.
+ - **Станция выбирается ближайшая к точке поиска**, а не оптимальная по числу остановок или времени.
+ - **Совпадение разъёмов точное:** у модели один `connector_type`, и он сравнивается со списком разъёмов станции как строка с учётом регистра.
+-- **Нет refresh-токенов, отзыва токена и ограничения частоты запросов.**
++- **Нет refresh-токенов и отзыва токена.** Ограничение частоты запросов есть, но хранится в памяти процесса и действует на каждую реплику отдельно.
+ - **Нет редактирования и удаления** машин и аккаунта через API.
+-- **Нагрузочного тестирования не было:** цель MVP — десятки одновременных пользователей. Расчёт и запись истории выполняются синхронно в обработчике запроса.
++- **Полноценного нагрузочного тестирования на Go-слое не было:** SQL-запросы проверены на синтетических данных (100 тыс. станций, 1 млн записей истории), но весь сервис под нагрузкой не гонялся. Расчёт и запись истории по-прежнему выполняются синхронно в обработчике запроса.
+ - **При недоступном Redis** каждый вызов провайдера пишет предупреждение в лог: приложение работает, но лог при долгой аварии разрастается.
+\ No newline at end of file
+diff --git a/cmd/api/main.go b/cmd/api/main.go
+index 6665c80..7438111 100644
+--- a/cmd/api/main.go
++++ b/cmd/api/main.go
+@@ -33,11 +33,19 @@ func main() {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ 	defer cancel()
+ 
+-	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
++	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
++	if err != nil {
++		log.Fatalf("failed to parse database url: %v", err)
++	}
++	if cfg.DBMaxConns > 0 {
++		poolCfg.MaxConns = int32(cfg.DBMaxConns)
++	}
++	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+ 	if err != nil {
+ 		log.Fatalf("failed to create database pool: %v", err)
+ 	}
+ 	defer dbPool.Close()
++	log.Printf("database pool: up to %d connections", poolCfg.MaxConns)
+ 
+ 	if err := dbPool.Ping(ctx); err != nil {
+ 		log.Fatalf("failed to ping database: %v", err)
+@@ -57,8 +65,9 @@ func main() {
+ 	historyService := historysvc.NewService(repo)
+ 
+ 	authService, err := auth.NewService(repo, auth.Config{
+-		Secret: []byte(cfg.JWTSecret),
+-		TTL:    cfg.JWTTTL,
++		Secret:              []byte(cfg.JWTSecret),
++		TTL:                 cfg.JWTTTL,
++		BcryptMaxConcurrent: cfg.BcryptMaxConcurrency,
+ 	})
+ 	if err != nil {
+ 		log.Fatalf("failed to create auth service: %v", err)
+@@ -86,6 +95,12 @@ func main() {
+ 		Routes:   handler.NewRoutesHandler(routingService, vehicleService, historyService, logger),
+ 		History:  handler.NewHistoryHandler(historyService, logger),
+ 		Tokens:   authService,
++		Limits: handler.RateLimits{
++			Auth:              handler.RateLimit{PerMinute: cfg.RateLimitAuthPerMin, Burst: cfg.RateLimitAuthBurst},
++			Public:            handler.RateLimit{PerMinute: cfg.RateLimitPublicPerMin, Burst: cfg.RateLimitPublicBurst},
++			Routes:            handler.RateLimit{PerMinute: cfg.RateLimitRoutesPerMin, Burst: cfg.RateLimitRoutesBurst},
++			TrustProxyHeaders: cfg.TrustProxyHeaders,
++		},
+ 	})
+ 
+ 	srv := &http.Server{
+diff --git a/cmd/api/provider.go b/cmd/api/provider.go
+index 685f47a..d736264 100644
+--- a/cmd/api/provider.go
++++ b/cmd/api/provider.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/IvanLobanok/evnavigation/internal/config"
+ 	"github.com/IvanLobanok/evnavigation/internal/models/route"
+ 	"github.com/IvanLobanok/evnavigation/internal/provider/cache"
++	"github.com/IvanLobanok/evnavigation/internal/provider/limit"
+ 	"github.com/IvanLobanok/evnavigation/internal/provider/mock"
+ 	"github.com/IvanLobanok/evnavigation/internal/provider/yandex"
+ )
+@@ -30,6 +31,10 @@ func newRouteProvider(ctx context.Context, cfg *config.Config, logger *slog.Logg
+ 		return nil, nil, fmt.Errorf("unknown route provider %q", cfg.RouteProvider)
+ 	}
+ 
++	// Потолок на одновременные вызовы провайдера стоит под кэшем: попадания в кэш слотов не занимают,
++	// а параллельные одинаковые запросы кэш уже схлопнул (singleflight).
++	base = limit.New(base, cfg.RouteProviderMaxConcurrency)
++
+ 	if cfg.RedisURL == "" {
+ 		logger.Info("route cache is disabled (REDIS_URL is empty)", "provider", cfg.RouteProvider)
+ 		return base, func() {}, nil
+diff --git a/cmd/api/provider_test.go b/cmd/api/provider_test.go
+index 23c1100..17a0a1f 100644
+--- a/cmd/api/provider_test.go
++++ b/cmd/api/provider_test.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/IvanLobanok/evnavigation/internal/config"
+ 	"github.com/IvanLobanok/evnavigation/internal/models/route"
+ 	"github.com/IvanLobanok/evnavigation/internal/provider/cache"
++	"github.com/IvanLobanok/evnavigation/internal/provider/limit"
+ 	"github.com/IvanLobanok/evnavigation/internal/provider/mock"
+ 	"github.com/IvanLobanok/evnavigation/internal/provider/yandex"
+ )
+@@ -30,6 +31,42 @@ func TestNewRouteProvider_MockWithoutRedis(t *testing.T) {
+ 	}
+ }
+ 
++func TestNewRouteProvider_ConcurrencyLimitWrapsTheProvider(t *testing.T) {
++	cfg := testConfig()
++	cfg.RouteProviderMaxConcurrency = 4
++
++	p, closeFn, err := newRouteProvider(context.Background(), cfg, slog.Default())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer closeFn()
++
++	if _, ok := p.(*limit.Provider); !ok {
++		t.Fatalf("with ROUTE_PROVIDER_MAX_CONCURRENCY>0 the limiting decorator is expected, got %T", p)
++	}
++	segs, err := p.BuildRoute(context.Background(), route.RoutePoint{Lat: 53.9, Lon: 27.5}, route.RoutePoint{Lat: 53.8, Lon: 27.4})
++	if err != nil || len(segs) == 0 {
++		t.Errorf("routing must work through the limiter: n=%d err=%v", len(segs), err)
++	}
++}
++
++func TestNewRouteProvider_LimiterSitsUnderTheCache(t *testing.T) {
++	// кэш снаружи: попадания в кэш не должны занимать слоты, отведённые под вызовы настоящего провайдера
++	cfg := testConfig()
++	cfg.RouteProviderMaxConcurrency = 4
++	cfg.RedisURL = "redis://127.0.0.1:1/0"
++
++	p, closeFn, err := newRouteProvider(context.Background(), cfg, slog.Default())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer closeFn()
++
++	if _, ok := p.(*cache.Provider); !ok {
++		t.Errorf("the cache must be the outermost decorator, got %T", p)
++	}
++}
++
+ func TestNewRouteProvider_RedisWrapsTheProviderInACache(t *testing.T) {
+ 	cfg := testConfig()
+ 	cfg.RedisURL = "redis://127.0.0.1:1/0" // Redis недоступен: приложение всё равно должно запуститься
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 6ac811b..5156596 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -26,6 +26,20 @@ type Config struct {
+ 	RouteCacheTTL time.Duration
+ 
+ 	Routing routing.Config
++
++	// --- защита от перегрузки ---
++	DBMaxConns                  int // размер пула соединений с PostgreSQL; 0 - по умолчанию pgx (max(4, число CPU))
++	RouteProviderMaxConcurrency int // одновременных вызовов провайдера маршрутов; 0 - без ограничения
++	BcryptMaxConcurrency        int // одновременных bcrypt-операций; 0 - runtime.GOMAXPROCS
++
++	// ограничения частоты запросов; 0 запросов в минуту выключает соответствующее ограничение
++	RateLimitAuthPerMin   int
++	RateLimitAuthBurst    int
++	RateLimitPublicPerMin int
++	RateLimitPublicBurst  int
++	RateLimitRoutesPerMin int
++	RateLimitRoutesBurst  int
++	TrustProxyHeaders     bool // IP клиента брать из X-Forwarded-For (только за своим прокси)
+ }
+ 
+ type envReader struct {
+@@ -68,7 +82,20 @@ func Load() (*Config, error) {
+ 			MaxStationCandidates:  r.int("MAX_STATION_CANDIDATES", 3),
+ 			LookbackStepKm:        r.float("LOOKBACK_STEP_KM", 5),
+ 			MaxLookbackKm:         r.float("MAX_LOOKBACK_KM", 30),
++			CandidateParallelism:  r.int("ROUTE_CANDIDATE_PARALLELISM", 1),
+ 		},
++
++		DBMaxConns:                  r.int("DB_MAX_CONNS", 0),
++		RouteProviderMaxConcurrency: r.int("ROUTE_PROVIDER_MAX_CONCURRENCY", 32),
++		BcryptMaxConcurrency:        r.int("BCRYPT_MAX_CONCURRENCY", 0),
++
++		RateLimitAuthPerMin:   r.int("RATE_LIMIT_AUTH_PER_MIN", 30),
++		RateLimitAuthBurst:    r.int("RATE_LIMIT_AUTH_BURST", 10),
++		RateLimitPublicPerMin: r.int("RATE_LIMIT_PUBLIC_PER_MIN", 300),
++		RateLimitPublicBurst:  r.int("RATE_LIMIT_PUBLIC_BURST", 60),
++		RateLimitRoutesPerMin: r.int("RATE_LIMIT_ROUTES_PER_MIN", 60),
++		RateLimitRoutesBurst:  r.int("RATE_LIMIT_ROUTES_BURST", 10),
++		TrustProxyHeaders:     r.bool("TRUST_PROXY_HEADERS", false),
+ 	}
+ 	if err := r.err(); err != nil {
+ 		return nil, fmt.Errorf("invalid configuration: %w", err)
+@@ -85,6 +112,9 @@ func Load() (*Config, error) {
+ 	if cfg.RouteCacheTTL <= 0 {
+ 		return nil, errors.New("invalid configuration: ROUTE_CACHE_TTL must be positive")
+ 	}
++	if err := cfg.validateLimits(); err != nil {
++		return nil, fmt.Errorf("invalid configuration: %w", err)
++	}
+ 	if cfg.AppEnv == "production" && len(cfg.JWTSecret) < minProductionSecretLen {
+ 		return nil, fmt.Errorf("invalid configuration: JWT_SECRET must be at least %d characters when APP_ENV=production", minProductionSecretLen)
+ 	}
+@@ -94,6 +124,38 @@ func Load() (*Config, error) {
+ 
+ const minProductionSecretLen = 32
+ 
++// validateLimits: отрицательные значения бессмысленны, а включённому ограничению нужно ведро хотя бы на один запрос.
++func (c *Config) validateLimits() error {
++	var errs []error
++	nonNegative := map[string]int{
++		"DB_MAX_CONNS":                   c.DBMaxConns,
++		"ROUTE_PROVIDER_MAX_CONCURRENCY": c.RouteProviderMaxConcurrency,
++		"BCRYPT_MAX_CONCURRENCY":         c.BcryptMaxConcurrency,
++		"ROUTE_CANDIDATE_PARALLELISM":    c.Routing.CandidateParallelism,
++		"RATE_LIMIT_AUTH_PER_MIN":        c.RateLimitAuthPerMin,
++		"RATE_LIMIT_PUBLIC_PER_MIN":      c.RateLimitPublicPerMin,
++		"RATE_LIMIT_ROUTES_PER_MIN":      c.RateLimitRoutesPerMin,
++	}
++	for name, v := range nonNegative {
++		if v < 0 {
++			errs = append(errs, fmt.Errorf("%s must not be negative, got %d", name, v))
++		}
++	}
++	for _, l := range []struct {
++		perMin, burst int
++		burstName     string
++	}{
++		{c.RateLimitAuthPerMin, c.RateLimitAuthBurst, "RATE_LIMIT_AUTH_BURST"},
++		{c.RateLimitPublicPerMin, c.RateLimitPublicBurst, "RATE_LIMIT_PUBLIC_BURST"},
++		{c.RateLimitRoutesPerMin, c.RateLimitRoutesBurst, "RATE_LIMIT_ROUTES_BURST"},
++	} {
++		if l.perMin > 0 && l.burst < 1 {
++			errs = append(errs, fmt.Errorf("%s must be at least 1 while the limit is enabled, got %d", l.burstName, l.burst))
++		}
++	}
++	return errors.Join(errs...)
++}
++
+ func (r *envReader) float(key string, fallback float64) float64 {
+ 	raw, ok := os.LookupEnv(key)
+ 	if !ok || raw == "" {
+@@ -122,6 +184,19 @@ func (r *envReader) int(key string, fallback int) int {
+ 	return v
+ }
+ 
++func (r *envReader) bool(key string, fallback bool) bool {
++	raw, ok := os.LookupEnv(key)
++	if !ok || raw == "" {
++		return fallback
++	}
++	v, err := strconv.ParseBool(raw)
++	if err != nil {
++		r.errs = append(r.errs, fmt.Errorf("%s=%q: not a boolean (true or false)", key, raw))
++		return fallback
++	}
++	return v
++}
++
+ func (r *envReader) duration(key string, fallback time.Duration) time.Duration {
+ 	raw, ok := os.LookupEnv(key)
+ 	if !ok || raw == "" {
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index b5bbd4b..cf26ca2 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -23,6 +23,7 @@ func TestLoad_Defaults(t *testing.T) {
+ 		MaxStationCandidates:  3,
+ 		LookbackStepKm:        5,
+ 		MaxLookbackKm:         30,
++		CandidateParallelism:  1,
+ 	}
+ 	if cfg.Routing != want {
+ 		t.Errorf("routing defaults:\n got  %+v\n want %+v", cfg.Routing, want)
+@@ -281,3 +282,76 @@ func TestLoad_ProductionWithEmptySecretIsRejected(t *testing.T) {
+ 		t.Fatal("an empty secret in production must be rejected")
+ 	}
+ }
++
++func TestLoad_OverloadProtectionDefaults(t *testing.T) {
++	cfg, err := Load()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.DBMaxConns != 0 || cfg.BcryptMaxConcurrency != 0 || cfg.RouteProviderMaxConcurrency != 32 {
++		t.Errorf("pool/concurrency defaults: db=%d bcrypt=%d provider=%d", cfg.DBMaxConns, cfg.BcryptMaxConcurrency, cfg.RouteProviderMaxConcurrency)
++	}
++	if cfg.RateLimitAuthPerMin != 30 || cfg.RateLimitAuthBurst != 10 ||
++		cfg.RateLimitPublicPerMin != 300 || cfg.RateLimitPublicBurst != 60 ||
++		cfg.RateLimitRoutesPerMin != 60 || cfg.RateLimitRoutesBurst != 10 {
++		t.Errorf("rate limit defaults: %+v", cfg)
++	}
++	if cfg.TrustProxyHeaders {
++		t.Error("X-Forwarded-For must not be trusted by default: it would let clients forge their IP")
++	}
++}
++
++func TestLoad_OverloadProtectionOverrides(t *testing.T) {
++	t.Setenv("DB_MAX_CONNS", "40")
++	t.Setenv("BCRYPT_MAX_CONCURRENCY", "6")
++	t.Setenv("ROUTE_PROVIDER_MAX_CONCURRENCY", "0")
++	t.Setenv("ROUTE_CANDIDATE_PARALLELISM", "3")
++	t.Setenv("RATE_LIMIT_ROUTES_PER_MIN", "0")
++	t.Setenv("TRUST_PROXY_HEADERS", "true")
++
++	cfg, err := Load()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.DBMaxConns != 40 || cfg.BcryptMaxConcurrency != 6 || cfg.RouteProviderMaxConcurrency != 0 || cfg.Routing.CandidateParallelism != 3 {
++		t.Errorf("overrides were not applied: %+v", cfg)
++	}
++	if cfg.RateLimitRoutesPerMin != 0 || !cfg.TrustProxyHeaders {
++		t.Errorf("rate limit overrides: routes=%d trust=%v", cfg.RateLimitRoutesPerMin, cfg.TrustProxyHeaders)
++	}
++}
++
++func TestLoad_OverloadProtectionValidation(t *testing.T) {
++	tests := []struct {
++		name, key, value, wantInErr string
++	}{
++		{"negative pool", "DB_MAX_CONNS", "-1", "DB_MAX_CONNS"},
++		{"negative provider concurrency", "ROUTE_PROVIDER_MAX_CONCURRENCY", "-5", "ROUTE_PROVIDER_MAX_CONCURRENCY"},
++		{"negative bcrypt concurrency", "BCRYPT_MAX_CONCURRENCY", "-1", "BCRYPT_MAX_CONCURRENCY"},
++		{"negative parallelism", "ROUTE_CANDIDATE_PARALLELISM", "-2", "ROUTE_CANDIDATE_PARALLELISM"},
++		{"negative rate", "RATE_LIMIT_AUTH_PER_MIN", "-10", "RATE_LIMIT_AUTH_PER_MIN"},
++		{"zero burst while the limit is on", "RATE_LIMIT_ROUTES_BURST", "0", "RATE_LIMIT_ROUTES_BURST"},
++		{"not an integer", "RATE_LIMIT_PUBLIC_PER_MIN", "many", "RATE_LIMIT_PUBLIC_PER_MIN"},
++		{"not a boolean", "TRUST_PROXY_HEADERS", "maybe", "TRUST_PROXY_HEADERS"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv(tc.key, tc.value)
++			cfg, err := Load()
++			if err == nil {
++				t.Fatalf("%s=%s must be rejected, got %+v", tc.key, tc.value, cfg)
++			}
++			if !strings.Contains(err.Error(), tc.wantInErr) {
++				t.Errorf("the error must name %s: %v", tc.wantInErr, err)
++			}
++		})
++	}
++
++	t.Run("zero burst is fine when the limit is off", func(t *testing.T) {
++		t.Setenv("RATE_LIMIT_ROUTES_PER_MIN", "0")
++		t.Setenv("RATE_LIMIT_ROUTES_BURST", "0")
++		if _, err := Load(); err != nil {
++			t.Errorf("a disabled limit needs no burst: %v", err)
++		}
++	})
++}
+diff --git a/internal/config/env_example_test.go b/internal/config/env_example_test.go
+index 492d61b..93e8d53 100644
+--- a/internal/config/env_example_test.go
++++ b/internal/config/env_example_test.go
+@@ -59,7 +59,7 @@ func TestEnvExample_LoadsAndMatchesDefaults(t *testing.T) {
+ 	wantRouting := routing.Config{
+ 		CriticalChargePercent: 15, MinArrivalPercent: 5, TargetChargePercent: 80,
+ 		SearchRadiusMeters: 5000, MaxStops: 5, MaxStationCandidates: 3,
+-		LookbackStepKm: 5, MaxLookbackKm: 30,
++		LookbackStepKm: 5, MaxLookbackKm: 30, CandidateParallelism: 1,
+ 	}
+ 	if cfg.Routing != wantRouting {
+ 		t.Errorf("routing settings in .env.example differ from the defaults:\n got  %+v\n want %+v", cfg.Routing, wantRouting)
+@@ -99,10 +99,10 @@ func TestEnvExample_DocumentsEveryVariableTheCodeReads(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	// getEnv("X", ...), r.float("X", ...), r.int("X", ...), r.duration("X", ...)
+-	re := regexp.MustCompile(`(?:getEnv|\.float|\.int|\.duration)\("([A-Z][A-Z0-9_]*)"`)
++	// getEnv("X", ...), r.float("X", ...), r.int("X", ...), r.bool("X", ...), r.duration("X", ...)
++	re := regexp.MustCompile(`(?:getEnv|\.float|\.int|\.bool|\.duration)\("([A-Z][A-Z0-9_]*)"`)
+ 	matches := re.FindAllStringSubmatch(string(src), -1)
+-	if len(matches) < 20 {
++	if len(matches) < 30 {
+ 		t.Fatalf("expected to find the environment variables in config.go, found only %d (did the code style change?)", len(matches))
+ 	}
+ 
+diff --git a/internal/handler/auth.go b/internal/handler/auth.go
+index bf1c87c..bc1de63 100644
+--- a/internal/handler/auth.go
++++ b/internal/handler/auth.go
+@@ -68,6 +68,8 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+ 			writeValidationError(w, ve.Fields)
+ 		case errors.Is(err, user.ErrEmailTaken):
+ 			writeError(w, http.StatusConflict, "email_taken", "a user with this email already exists")
++		case errors.Is(err, auth.ErrBusy):
++			serviceBusy(w)
+ 		default:
+ 			internalError(w, r, h.log, "register", err)
+ 		}
+@@ -102,6 +104,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+ 			writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
+ 			return
+ 		}
++		if errors.Is(err, auth.ErrBusy) {
++			serviceBusy(w)
++			return
++		}
+ 		internalError(w, r, h.log, "login", err)
+ 		return
+ 	}
+@@ -112,3 +118,9 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+ 		ExpiresIn:   int(tok.ExpiresIn.Seconds()),
+ 	})
+ }
++
++// serviceBusy отвечает 503: сервер перегружен, повторить запрос можно чуть позже.
++func serviceBusy(w http.ResponseWriter) {
++	w.Header().Set("Retry-After", "1")
++	writeError(w, http.StatusServiceUnavailable, "service_busy", "the server is busy, retry shortly")
++}
+diff --git a/internal/handler/ratelimit.go b/internal/handler/ratelimit.go
+new file mode 100644
+index 0000000..411e89b
+--- /dev/null
++++ b/internal/handler/ratelimit.go
+@@ -0,0 +1,178 @@
++package handler
++
++import (
++	"math"
++	"net"
++	"net/http"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// RateLimit - ограничение частоты запросов на один ключ (IP или пользователя) по схеме «токенового ведра»:
++// в ведре помещается Burst запросов, а пополняется оно со скоростью PerMinute запросов в минуту.
++// PerMinute <= 0 выключает ограничение.
++type RateLimit struct {
++	PerMinute int
++	Burst     int
++}
++
++// RateLimits собирает ограничения для групп эндпоинтов. Нулевое значение выключает все ограничения.
++type RateLimits struct {
++	Auth   RateLimit // по IP: POST /auth/register и /auth/login (внутри каждого запроса - bcrypt)
++	Public RateLimit // по IP: GET /ev-models и /stations/nearby (без авторизации)
++	Routes RateLimit // по пользователю: POST /routes (самый дорогой запрос: вызовы провайдера и поиск станций)
++
++	// TrustProxyHeaders: брать IP клиента из последнего значения X-Forwarded-For.
++	// Включайте, только если сервис стоит за собственным прокси, который этот заголовок дописывает:
++	// иначе клиент подставит любой IP и обойдёт лимит. Без прокси держите выключенным.
++	// Если сервис за прокси, а флаг выключен, все клиенты делят один IP прокси и один общий лимит.
++	TrustProxyHeaders bool
++}
++
++const (
++	// maxLimiterKeys ограничивает память: больше ключей не отслеживаем (см. allow).
++	maxLimiterKeys = 100_000
++	sweepInterval  = time.Minute
++)
++
++type bucket struct {
++	tokens float64
++	last   time.Time
++}
++
++// limiter - набор вёдер по ключам. Горутин не запускает: простаивающие ключи вычищаются при обращениях.
++type limiter struct {
++	mu        sync.Mutex
++	buckets   map[string]*bucket
++	rate      float64 // токенов в секунду
++	burst     float64
++	now       func() time.Time
++	lastSweep time.Time
++}
++
++// newLimiter возвращает nil, если ограничение выключено.
++func newLimiter(rl RateLimit) *limiter {
++	if rl.PerMinute <= 0 {
++		return nil
++	}
++	burst := rl.Burst
++	if burst < 1 {
++		burst = 1
++	}
++	return &limiter{
++		buckets: make(map[string]*bucket),
++		rate:    float64(rl.PerMinute) / 60,
++		burst:   float64(burst),
++		now:     time.Now,
++	}
++}
++
++// allow расходует один токен ключа. Если токенов нет, возвращает false и время до следующего токена.
++func (l *limiter) allow(key string) (bool, time.Duration) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++
++	now := l.now()
++	l.sweep(now)
++
++	b, ok := l.buckets[key]
++	if !ok {
++		if len(l.buckets) >= maxLimiterKeys {
++			// Памяти больше не даём: лучше пропустить запрос без учёта, чем отказать всем новым клиентам.
++			return true, 0
++		}
++		b = &bucket{tokens: l.burst, last: now}
++		l.buckets[key] = b
++	}
++
++	if elapsed := now.Sub(b.last).Seconds(); elapsed > 0 {
++		b.tokens = math.Min(l.burst, b.tokens+elapsed*l.rate)
++		b.last = now
++	}
++	if b.tokens >= 1 {
++		b.tokens--
++		return true, 0
++	}
++	return false, time.Duration((1 - b.tokens) / l.rate * float64(time.Second))
++}
++
++// sweep удаляет вёдра, которые успели наполниться доверху: они равнозначны новому ведру.
++func (l *limiter) sweep(now time.Time) {
++	if now.Sub(l.lastSweep) < sweepInterval && len(l.buckets) < maxLimiterKeys {
++		return
++	}
++	l.lastSweep = now
++	for k, b := range l.buckets {
++		if b.tokens+now.Sub(b.last).Seconds()*l.rate >= l.burst {
++			delete(l.buckets, k)
++		}
++	}
++}
++
++// limitBy возвращает middleware, который пропускает запрос, пока у его ключа есть токены, иначе отвечает 429.
++// Если ключ определить не удалось (key вернул false), запрос пропускается: лимит не должен ломать запросы.
++func limitBy(rl RateLimit, key func(*http.Request) (string, bool)) func(http.Handler) http.Handler {
++	l := newLimiter(rl)
++	return func(next http.Handler) http.Handler {
++		if l == nil {
++			return next
++		}
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			k, ok := key(r)
++			if !ok {
++				next.ServeHTTP(w, r)
++				return
++			}
++			if allowed, wait := l.allow(k); !allowed {
++				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(wait.Seconds()))))
++				writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests, slow down")
++				return
++			}
++			next.ServeHTTP(w, r)
++		})
++	}
++}
++
++// limitByIP ограничивает по IP клиента.
++func limitByIP(rl RateLimit, trustProxy bool) func(http.Handler) http.Handler {
++	return limitBy(rl, func(r *http.Request) (string, bool) { return clientIP(r, trustProxy), true })
++}
++
++// limitByUser ограничивает по id пользователя; ставится после Authenticate.
++func limitByUser(rl RateLimit) func(http.Handler) http.Handler {
++	return limitBy(rl, func(r *http.Request) (string, bool) {
++		id, ok := UserIDFromContext(r.Context())
++		return strconv.Itoa(id), ok
++	})
++}
++
++// clientIP определяет адрес клиента. IPv6 сворачивается до сети /64: у одного абонента их обычно сколько угодно,
++// и иначе лимит обходился бы сменой адреса.
++func clientIP(r *http.Request, trustProxy bool) string {
++	if trustProxy {
++		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
++			// последнее значение дописал наш прокси, всё левее - слова клиента
++			parts := strings.Split(xff, ",")
++			if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
++				return normalizeIP(ip)
++			}
++		}
++	}
++	host, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil {
++		host = r.RemoteAddr
++	}
++	if ip := net.ParseIP(host); ip != nil {
++		return normalizeIP(ip)
++	}
++	return host
++}
++
++func normalizeIP(ip net.IP) string {
++	if v4 := ip.To4(); v4 != nil {
++		return v4.String()
++	}
++	return ip.Mask(net.CIDRMask(64, 128)).String()
++}
+diff --git a/internal/handler/ratelimit_test.go b/internal/handler/ratelimit_test.go
+new file mode 100644
+index 0000000..6a0f547
+--- /dev/null
++++ b/internal/handler/ratelimit_test.go
+@@ -0,0 +1,393 @@
++package handler
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/IvanLobanok/evnavigation/internal/service/auth"
++)
++
++// fakeClock - управляемое время для детерминированных тестов ведра.
++type fakeClock struct {
++	mu sync.Mutex
++	t  time.Time
++}
++
++func (c *fakeClock) now() time.Time {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.t
++}
++
++func (c *fakeClock) advance(d time.Duration) {
++	c.mu.Lock()
++	c.t = c.t.Add(d)
++	c.mu.Unlock()
++}
++
++func newClockLimiter(perMinute, burst int) (*limiter, *fakeClock) {
++	l := newLimiter(RateLimit{PerMinute: perMinute, Burst: burst})
++	clk := &fakeClock{t: time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)}
++	l.now = clk.now
++	return l, clk
++}
++
++// ---------------------------------------------------------------------------
++// Ведро
++// ---------------------------------------------------------------------------
++
++func TestLimiter_BurstThenRefuse(t *testing.T) {
++	l, _ := newClockLimiter(60, 3) // 1 токен в секунду, ведро на 3
++
++	for i := 0; i < 3; i++ {
++		if ok, _ := l.allow("k"); !ok {
++			t.Fatalf("request %d within the burst must pass", i+1)
++		}
++	}
++	ok, wait := l.allow("k")
++	if ok {
++		t.Fatal("the 4th request must be refused")
++	}
++	if wait <= 0 || wait > time.Second {
++		t.Errorf("wait for the next token: got %v, want within (0, 1s]", wait)
++	}
++}
++
++func TestLimiter_RefillsOverTime(t *testing.T) {
++	l, clk := newClockLimiter(60, 2)
++	l.allow("k")
++	l.allow("k")
++	if ok, _ := l.allow("k"); ok {
++		t.Fatal("bucket must be empty")
++	}
++
++	clk.advance(1 * time.Second) // +1 токен
++	if ok, _ := l.allow("k"); !ok {
++		t.Error("one token must have been refilled after 1s")
++	}
++	if ok, _ := l.allow("k"); ok {
++		t.Error("only one token was refilled")
++	}
++
++	// ведро не переполняется выше burst: и при паузе короче интервала чистки (тут работает сам кап),
++	// и при паузе в час (тут ведро ещё и вычищается как полное)
++	for _, pause := range []time.Duration{30 * time.Second, time.Hour} {
++		clk.advance(pause)
++		for i := 0; i < 2; i++ {
++			if ok, _ := l.allow("k"); !ok {
++				t.Fatalf("pause %v: request %d must pass", pause, i+1)
++			}
++		}
++		if ok, _ := l.allow("k"); ok {
++			t.Errorf("pause %v: the bucket must be capped at burst, not accumulate tokens", pause)
++		}
++	}
++}
++
++func TestLimiter_KeysAreIndependent(t *testing.T) {
++	l, _ := newClockLimiter(60, 1)
++	if ok, _ := l.allow("a"); !ok {
++		t.Fatal("a: first request")
++	}
++	if ok, _ := l.allow("a"); ok {
++		t.Fatal("a: second request must be refused")
++	}
++	if ok, _ := l.allow("b"); !ok {
++		t.Error("b must not be affected by a")
++	}
++}
++
++func TestLimiter_SweepsIdleKeys(t *testing.T) {
++	l, clk := newClockLimiter(60, 2)
++	for i := 0; i < 50; i++ {
++		l.allow(fmt.Sprintf("k%d", i))
++	}
++	if len(l.buckets) != 50 {
++		t.Fatalf("setup: %d buckets", len(l.buckets))
++	}
++
++	clk.advance(10 * time.Minute) // все вёдра давно полны: помнить их незачем
++	l.allow("fresh")
++	if len(l.buckets) != 1 {
++		t.Errorf("idle buckets must be dropped, %d remain", len(l.buckets))
++	}
++}
++
++func TestLimiter_FailsOpenWhenTooManyKeys(t *testing.T) {
++	l, _ := newClockLimiter(60, 1)
++	for i := 0; i < maxLimiterKeys; i++ {
++		l.buckets[fmt.Sprintf("k%d", i)] = &bucket{tokens: 0, last: l.now()} // не полные: sweep их не уберёт
++	}
++	for i := 0; i < 3; i++ {
++		if ok, _ := l.allow("newcomer"); !ok {
++			t.Fatal("a new key beyond the memory cap must be let through, not refused")
++		}
++	}
++	if len(l.buckets) > maxLimiterKeys {
++		t.Errorf("memory cap exceeded: %d keys", len(l.buckets))
++	}
++}
++
++func TestLimiter_DisabledByZeroRate(t *testing.T) {
++	for _, rl := range []RateLimit{{}, {PerMinute: 0, Burst: 5}, {PerMinute: -3, Burst: 5}} {
++		if newLimiter(rl) != nil {
++			t.Errorf("%+v must disable the limiter", rl)
++		}
++	}
++	// а выключенный middleware ничего не меняет
++	h := limitByIP(RateLimit{}, false)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
++	for i := 0; i < 50; i++ {
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
++		if rec.Code != http.StatusNoContent {
++			t.Fatalf("request %d: %d", i, rec.Code)
++		}
++	}
++}
++
++func TestLimiter_ZeroBurstStillAllowsOneRequest(t *testing.T) {
++	l, _ := newClockLimiter(60, 0)
++	if ok, _ := l.allow("k"); !ok {
++		t.Error("a bucket must hold at least one token")
++	}
++}
++
++func TestLimiter_ConcurrentUse(t *testing.T) {
++	l := newLimiter(RateLimit{PerMinute: 60, Burst: 100})
++	var wg sync.WaitGroup
++	var mu sync.Mutex
++	passed := 0
++	for i := 0; i < 400; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			if ok, _ := l.allow("shared"); ok {
++				mu.Lock()
++				passed++
++				mu.Unlock()
++			}
++		}()
++	}
++	wg.Wait()
++	// ведро на 100 токенов и 1 токен/с: за мгновение пройти может немного больше 100, но не 400
++	if passed < 100 || passed > 102 {
++		t.Errorf("passed %d of 400, want about 100", passed)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// IP клиента
++// ---------------------------------------------------------------------------
++
++func TestClientIP(t *testing.T) {
++	tests := []struct {
++		name       string
++		remote     string
++		xff        string
++		trustProxy bool
++		want       string
++	}{
++		{"plain ipv4", "203.0.113.7:51000", "", false, "203.0.113.7"},
++		{"xff is ignored without trust (it is client-controlled)", "203.0.113.7:51000", "1.2.3.4", false, "203.0.113.7"},
++		{"trusted proxy: last xff entry", "10.0.0.2:4444", "9.9.9.9, 198.51.100.5", true, "198.51.100.5"},
++		{"trusted proxy: forged left entries are ignored", "10.0.0.2:4444", "6.6.6.6, 7.7.7.7, 198.51.100.5", true, "198.51.100.5"},
++		{"trusted proxy: garbage xff falls back to the peer", "10.0.0.2:4444", "not-an-ip", true, "10.0.0.2"},
++		{"trusted proxy: no xff falls back to the peer", "10.0.0.2:4444", "", true, "10.0.0.2"},
++		{"ipv6 is folded to /64", "[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:80", "", false, "2001:db8:1:2::"},
++		{"another address of the same /64 is the same client", "[2001:db8:1:2:1111:2222:3333:4444]:80", "", false, "2001:db8:1:2::"},
++		{"ipv4-mapped ipv6 is treated as ipv4", "[::ffff:203.0.113.7]:80", "", false, "203.0.113.7"},
++		{"remote without a port", "203.0.113.7", "", false, "203.0.113.7"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			req := httptest.NewRequest(http.MethodGet, "/", nil)
++			req.RemoteAddr = tc.remote
++			if tc.xff != "" {
++				req.Header.Set("X-Forwarded-For", tc.xff)
++			}
++			if got := clientIP(req, tc.trustProxy); got != tc.want {
++				t.Errorf("got %q, want %q", got, tc.want)
++			}
++		})
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Через роутер
++// ---------------------------------------------------------------------------
++
++// twoUsers выдаёт токены двух разных пользователей.
++type twoUsers struct{}
++
++func (twoUsers) ParseToken(token string) (int, error) {
++	switch token {
++	case "tok-a":
++		return 1, nil
++	case "tok-b":
++		return 2, nil
++	}
++	return 0, errBadToken
++}
++
++func limitedRouter(limits RateLimits) http.Handler {
++	vehicles := &fakeVehicles{details: testVehicle}
++	return NewRouter(Handlers{
++		Auth:     NewAuthHandler(&fakeAuth{}, nil),
++		Vehicles: NewVehicleHandler(&fakeVehicleService{}, nil),
++		Stations: NewStationHandler(&fakeStationFinder{stations: manyStations(2)}, nil),
++		Routes:   NewRoutesHandler(&fakePlanner{plan: samplePlan()}, vehicles, &fakeRecorder{}, nil),
++		History:  NewHistoryHandler(&fakeHistory{}, nil),
++		Tokens:   twoUsers{},
++		Limits:   limits,
++	})
++}
++
++func do(h http.Handler, method, path, body, token, remote string) *httptest.ResponseRecorder {
++	req := httptest.NewRequest(method, path, strings.NewReader(body))
++	if token != "" {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	if remote != "" {
++		req.RemoteAddr = remote
++	}
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++	return rec
++}
++
++func TestRouter_AuthLimitIsPerIPAndAnswers429(t *testing.T) {
++	h := limitedRouter(RateLimits{Auth: RateLimit{PerMinute: 60, Burst: 2}})
++	login := `{"email":"i@x.io","password":"password123"}`
++
++	for i := 0; i < 2; i++ {
++		if rec := do(h, http.MethodPost, "/auth/login", login, "", "203.0.113.1:1000"); rec.Code != http.StatusOK {
++			t.Fatalf("login %d: %d", i+1, rec.Code)
++		}
++	}
++	rec := do(h, http.MethodPost, "/auth/login", login, "", "203.0.113.1:1001") // другой порт - тот же клиент
++	if rec.Code != http.StatusTooManyRequests {
++		t.Fatalf("3rd login from one IP: got %d, want 429", rec.Code)
++	}
++	if rec.Header().Get("Retry-After") == "" {
++		t.Error("429 must carry Retry-After")
++	}
++	var body errorResponse
++	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error.Code != "rate_limited" {
++		t.Errorf("error body: %s (err=%v)", rec.Body, err)
++	}
++
++	// register делит ведро с login: оба упираются в bcrypt
++	if rec := do(h, http.MethodPost, "/auth/register", registerBody, "", "203.0.113.1:1002"); rec.Code != http.StatusTooManyRequests {
++		t.Errorf("register from the same IP: got %d, want 429", rec.Code)
++	}
++	// другой клиент не пострадал
++	if rec := do(h, http.MethodPost, "/auth/login", login, "", "203.0.113.2:1000"); rec.Code != http.StatusOK {
++		t.Errorf("another IP: got %d, want 200", rec.Code)
++	}
++}
++
++func TestRouter_RoutesLimitIsPerUser(t *testing.T) {
++	h := limitedRouter(RateLimits{Routes: RateLimit{PerMinute: 60, Burst: 2}})
++
++	for i := 0; i < 2; i++ {
++		if rec := do(h, http.MethodPost, "/routes", validBody, "tok-a", "203.0.113.1:1"); rec.Code != http.StatusOK {
++			t.Fatalf("user A request %d: %d: %s", i+1, rec.Code, rec.Body)
++		}
++	}
++	if rec := do(h, http.MethodPost, "/routes", validBody, "tok-a", "203.0.113.99:1"); rec.Code != http.StatusTooManyRequests {
++		t.Errorf("user A 3rd request (from another IP): got %d, want 429: the limit follows the user, not the address", rec.Code)
++	}
++	if rec := do(h, http.MethodPost, "/routes", validBody, "tok-b", "203.0.113.1:1"); rec.Code != http.StatusOK {
++		t.Errorf("user B shares an IP with A but must have their own bucket: got %d", rec.Code)
++	}
++}
++
++func TestRouter_RoutesLimitDoesNotHideAuthErrors(t *testing.T) {
++	// анонимные запросы получают 401 и не расходуют чужие ведра
++	h := limitedRouter(RateLimits{Routes: RateLimit{PerMinute: 60, Burst: 1}})
++	for i := 0; i < 5; i++ {
++		if rec := do(h, http.MethodPost, "/routes", validBody, "", ""); rec.Code != http.StatusUnauthorized {
++			t.Fatalf("anonymous request %d: got %d, want 401", i+1, rec.Code)
++		}
++	}
++}
++
++func TestRouter_PublicLimitAppliesToPublicReadsOnly(t *testing.T) {
++	h := limitedRouter(RateLimits{Public: RateLimit{PerMinute: 60, Burst: 1}})
++
++	if rec := do(h, http.MethodGet, "/stations/nearby?lat=53.9&lon=27.5", "", "", "203.0.113.1:1"); rec.Code != http.StatusOK {
++		t.Fatalf("first: %d", rec.Code)
++	}
++	if rec := do(h, http.MethodGet, "/ev-models", "", "", "203.0.113.1:2"); rec.Code != http.StatusTooManyRequests {
++		t.Errorf("/ev-models shares the public bucket: got %d, want 429", rec.Code)
++	}
++	for i := 0; i < 5; i++ {
++		if rec := do(h, http.MethodGet, "/healthz", "", "", "203.0.113.1:3"); rec.Code != http.StatusOK {
++			t.Fatalf("/healthz must never be limited: %d", rec.Code)
++		}
++	}
++}
++
++func TestRouter_NoLimitsByDefault(t *testing.T) {
++	h := limitedRouter(RateLimits{})
++	for i := 0; i < 100; i++ {
++		if rec := do(h, http.MethodPost, "/auth/login", `{"email":"i@x.io","password":"password123"}`, "", "203.0.113.1:1"); rec.Code != http.StatusOK {
++			t.Fatalf("request %d: %d", i+1, rec.Code)
++		}
++	}
++}
++
++func TestRouter_TrustedProxyHeaderSeparatesClients(t *testing.T) {
++	login := `{"email":"i@x.io","password":"password123"}`
++	send := func(h http.Handler, client string) int {
++		req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(login))
++		req.RemoteAddr = "10.0.0.2:5555" // всегда один и тот же прокси
++		req.Header.Set("X-Forwarded-For", "6.6.6.6, "+client)
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, req)
++		return rec.Code
++	}
++
++	trusted := limitedRouter(RateLimits{Auth: RateLimit{PerMinute: 60, Burst: 1}, TrustProxyHeaders: true})
++	if send(trusted, "198.51.100.1") != http.StatusOK || send(trusted, "198.51.100.2") != http.StatusOK {
++		t.Error("with a trusted proxy, different clients behind it must have separate buckets")
++	}
++	if send(trusted, "198.51.100.1") != http.StatusTooManyRequests {
++		t.Error("the same client behind the proxy must be limited")
++	}
++
++	untrusted := limitedRouter(RateLimits{Auth: RateLimit{PerMinute: 60, Burst: 1}})
++	if send(untrusted, "198.51.100.1") != http.StatusOK || send(untrusted, "198.51.100.2") != http.StatusTooManyRequests {
++		t.Error("without trust, every client behind the proxy shares the proxy's bucket")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// 503 при перегрузке bcrypt
++// ---------------------------------------------------------------------------
++
++func TestAuth_BusyAnswers503WithRetryAfter(t *testing.T) {
++	busy := &fakeAuth{registerErr: auth.ErrBusy, loginErr: auth.ErrBusy}
++	h := NewAuthHandler(busy, nil)
++
++	for name, rec := range map[string]*httptest.ResponseRecorder{
++		"register": postJSON(h.Register, registerBody),
++		"login":    postJSON(h.Login, `{"email":"i@x.io","password":"password123"}`),
++	} {
++		if rec.Code != http.StatusServiceUnavailable {
++			t.Errorf("%s: got %d, want 503", name, rec.Code)
++		}
++		if rec.Header().Get("Retry-After") == "" {
++			t.Errorf("%s: 503 must carry Retry-After", name)
++		}
++		if !strings.Contains(rec.Body.String(), "service_busy") {
++			t.Errorf("%s: body %s", name, rec.Body)
++		}
++	}
++}
+diff --git a/internal/handler/router.go b/internal/handler/router.go
+index 2a6126a..50a330b 100644
+--- a/internal/handler/router.go
++++ b/internal/handler/router.go
+@@ -18,6 +18,9 @@ type Handlers struct {
+ 	Routes   *RoutesHandler
+ 	History  *HistoryHandler
+ 	Tokens   TokenParser // для middleware Authenticate
++
++	// Limits - ограничения частоты запросов; нулевое значение выключает их.
++	Limits RateLimits
+ }
+ 
+ func NewRouter(h Handlers) http.Handler {
+@@ -32,10 +35,13 @@ func NewRouter(h Handlers) http.Handler {
+ 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+ 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+ 	})
+-	r.Post("/auth/register", h.Auth.Register)
+-	r.Post("/auth/login", h.Auth.Login)
+-	r.Get("/ev-models", h.Vehicles.ListModels)
+-	r.Get("/stations/nearby", h.Stations.Nearby)
++
++	authLimit := limitByIP(h.Limits.Auth, h.Limits.TrustProxyHeaders)
++	publicLimit := limitByIP(h.Limits.Public, h.Limits.TrustProxyHeaders)
++	r.With(authLimit).Post("/auth/register", h.Auth.Register)
++	r.With(authLimit).Post("/auth/login", h.Auth.Login)
++	r.With(publicLimit).Get("/ev-models", h.Vehicles.ListModels)
++	r.With(publicLimit).Get("/stations/nearby", h.Stations.Nearby)
+ 
+ 	// эндпоинты, требующие JWT
+ 	r.Group(func(r chi.Router) {
+@@ -45,7 +51,7 @@ func NewRouter(h Handlers) http.Handler {
+ 		r.Get("/vehicles", h.Vehicles.List)
+ 		r.Get("/vehicles/{id}", h.Vehicles.Get)
+ 
+-		r.Post("/routes", h.Routes.PlanRoute)
++		r.With(limitByUser(h.Limits.Routes)).Post("/routes", h.Routes.PlanRoute)
+ 		r.Get("/routes/history", h.History.List)
+ 	})
+ 
+diff --git a/internal/handler/stations.go b/internal/handler/stations.go
+index ed9b010..fa77d23 100644
+--- a/internal/handler/stations.go
++++ b/internal/handler/stations.go
+@@ -21,9 +21,10 @@ const (
+ )
+ 
+ // StationFinder ищет доступные зарядные станции вокруг точки (реализует station.Service).
+-// Станции приходят отсортированными по расстоянию от точки.
++// Станции приходят отсортированными по расстоянию от точки, не больше limit штук;
++// непустой preferredConnectors оставляет только станции хотя бы с одним из этих разъёмов.
+ type StationFinder interface {
+-	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error)
++	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string, limit int) ([]station.ChargingStation, error)
+ }
+ 
+ type StationHandler struct {
+@@ -64,7 +65,8 @@ func (h *StationHandler) Nearby(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	found, err := h.finder.GetAvailableNearbyStations(r.Context(), q.lat, q.lon, q.radiusKm*1000, q.connectors)
++	// просим на одну станцию больше limit: по ней узнаём, были ли ещё станции (truncated), не загружая остальные
++	found, err := h.finder.GetAvailableNearbyStations(r.Context(), q.lat, q.lon, q.radiusKm*1000, q.connectors, q.limit+1)
+ 	if err != nil {
+ 		internalError(w, r, h.log, "find nearby stations", err)
+ 		return
+diff --git a/internal/handler/stations_test.go b/internal/handler/stations_test.go
+index f3cfb55..0dda7ad 100644
+--- a/internal/handler/stations_test.go
++++ b/internal/handler/stations_test.go
+@@ -21,11 +21,12 @@ type fakeStationFinder struct {
+ 
+ 	gotLat, gotLon, gotRadius float64
+ 	gotConnectors             []string
++	gotLimit                  int
+ }
+ 
+-func (f *fakeStationFinder) GetAvailableNearbyStations(_ context.Context, lat, lon, radiusMeters float64, connectors []string) ([]station.ChargingStation, error) {
++func (f *fakeStationFinder) GetAvailableNearbyStations(_ context.Context, lat, lon, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error) {
+ 	f.calls++
+-	f.gotLat, f.gotLon, f.gotRadius, f.gotConnectors = lat, lon, radiusMeters, connectors
++	f.gotLat, f.gotLon, f.gotRadius, f.gotConnectors, f.gotLimit = lat, lon, radiusMeters, connectors, limit
+ 	return f.stations, f.err
+ }
+ 
+@@ -311,3 +312,27 @@ func TestDistanceMeters(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestNearby_AsksFinderForOneMoreThanLimit(t *testing.T) {
++	// лишняя станция нужна только для флага truncated: загружать все станции в радиусе не нужно
++	tests := []struct {
++		name      string
++		query     string
++		wantLimit int
++	}{
++		{"default limit", "lat=53.9&lon=27.5", defaultLimit + 1},
++		{"explicit limit", "lat=53.9&lon=27.5&limit=7", 8},
++		{"max limit", "lat=53.9&lon=27.5&limit=100", 101},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			finder := &fakeStationFinder{}
++			if rec := getNearby(NewStationHandler(finder, nil), tc.query); rec.Code != http.StatusOK {
++				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
++			}
++			if finder.gotLimit != tc.wantLimit {
++				t.Errorf("finder asked for %d stations, want %d", finder.gotLimit, tc.wantLimit)
++			}
++		})
++	}
++}
+diff --git a/internal/provider/limit/limit.go b/internal/provider/limit/limit.go
+new file mode 100644
+index 0000000..19f1d14
+--- /dev/null
++++ b/internal/provider/limit/limit.go
+@@ -0,0 +1,37 @@
++// Package limit ограничивает число одновременных вызовов провайдера маршрутов.
++//
++// Внешний API маршрутов имеет квоты и конечную пропускную способность. Без ограничения всплеск запросов к /routes
++// превращается во всплеск обращений к нему (на один запрос приходится до десятков вызовов), и провайдер начинает
++// отвечать ошибками. Здесь лишние вызовы ждут слот, пока не истечёт контекст запроса.
++package limit
++
++import (
++	"context"
++
++	"github.com/IvanLobanok/evnavigation/internal/models/route"
++)
++
++// Provider пропускает к next не больше maxConcurrent вызовов BuildRoute одновременно.
++type Provider struct {
++	next  route.RouteProvider
++	slots chan struct{}
++}
++
++// New оборачивает next. maxConcurrent <= 0 не ограничивает: возвращается сам next.
++func New(next route.RouteProvider, maxConcurrent int) route.RouteProvider {
++	if maxConcurrent <= 0 {
++		return next
++	}
++	return &Provider{next: next, slots: make(chan struct{}, maxConcurrent)}
++}
++
++func (p *Provider) BuildRoute(ctx context.Context, from, to route.RoutePoint) ([]route.RouteSegment, error) {
++	select {
++	case p.slots <- struct{}{}:
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++	defer func() { <-p.slots }()
++
++	return p.next.BuildRoute(ctx, from, to)
++}
+diff --git a/internal/provider/limit/limit_test.go b/internal/provider/limit/limit_test.go
+new file mode 100644
+index 0000000..26b3441
+--- /dev/null
++++ b/internal/provider/limit/limit_test.go
+@@ -0,0 +1,139 @@
++package limit
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/IvanLobanok/evnavigation/internal/models/route"
++)
++
++type probe struct {
++	mu            sync.Mutex
++	running, peak int
++	calls         int
++	hold          time.Duration
++	err           error
++	panicNow      bool
++}
++
++func (p *probe) BuildRoute(_ context.Context, _, _ route.RoutePoint) ([]route.RouteSegment, error) {
++	p.mu.Lock()
++	p.calls++
++	p.running++
++	p.peak = max(p.peak, p.running)
++	hold, err, boom := p.hold, p.err, p.panicNow
++	p.mu.Unlock()
++
++	defer func() {
++		p.mu.Lock()
++		p.running--
++		p.mu.Unlock()
++	}()
++	if boom {
++		panic("provider bug")
++	}
++	time.Sleep(hold)
++	return []route.RouteSegment{{DistanceMeters: 1}}, err
++}
++
++func TestNew_NonPositiveMeansNoLimit(t *testing.T) {
++	base := &probe{}
++	for _, n := range []int{0, -1} {
++		if got := New(base, n); got != route.RouteProvider(base) {
++			t.Errorf("max=%d: the provider must be returned as is", n)
++		}
++	}
++}
++
++func TestProvider_LimitsConcurrency(t *testing.T) {
++	base := &probe{hold: 15 * time.Millisecond}
++	p := New(base, 3)
++
++	var wg sync.WaitGroup
++	for i := 0; i < 20; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			if _, err := p.BuildRoute(context.Background(), route.RoutePoint{}, route.RoutePoint{}); err != nil {
++				t.Errorf("unexpected error: %v", err)
++			}
++		}()
++	}
++	wg.Wait()
++
++	if base.calls != 20 {
++		t.Errorf("every call must eventually reach the provider: %d of 20", base.calls)
++	}
++	if base.peak > 3 {
++		t.Errorf("up to %d calls ran at once, limit is 3", base.peak)
++	}
++	if base.peak < 3 {
++		t.Errorf("the slots must be fully usable: peak was %d", base.peak)
++	}
++}
++
++func TestProvider_WaitingCallGivesUpWithContext(t *testing.T) {
++	base := &probe{hold: 300 * time.Millisecond}
++	p := New(base, 1)
++
++	started := make(chan struct{})
++	go func() {
++		close(started)
++		_, _ = p.BuildRoute(context.Background(), route.RoutePoint{}, route.RoutePoint{})
++	}()
++	<-started
++	time.Sleep(30 * time.Millisecond) // первый вызов занял единственный слот
++
++	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
++	defer cancel()
++	start := time.Now()
++	_, err := p.BuildRoute(ctx, route.RoutePoint{}, route.RoutePoint{})
++
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("got %v, want context.DeadlineExceeded", err)
++	}
++	if time.Since(start) > 200*time.Millisecond {
++		t.Error("a waiting call must give up when its context expires, not wait for the slot")
++	}
++	base.mu.Lock()
++	calls := base.calls
++	base.mu.Unlock()
++	if calls != 1 {
++		t.Errorf("the abandoned call must not reach the provider, provider calls: %d", calls)
++	}
++}
++
++func TestProvider_PassesResultAndErrorThrough(t *testing.T) {
++	boom := errors.New("boom")
++	p := New(&probe{err: boom}, 2)
++
++	segs, err := p.BuildRoute(context.Background(), route.RoutePoint{}, route.RoutePoint{})
++	if !errors.Is(err, boom) {
++		t.Errorf("got %v, want the provider's error", err)
++	}
++	if len(segs) != 1 {
++		t.Errorf("segments must be passed through, got %d", len(segs))
++	}
++}
++
++func TestProvider_SlotIsReleasedAfterPanic(t *testing.T) {
++	base := &probe{panicNow: true}
++	p := New(base, 1)
++
++	func() {
++		defer func() { _ = recover() }()
++		_, _ = p.BuildRoute(context.Background(), route.RoutePoint{}, route.RoutePoint{})
++	}()
++
++	base.mu.Lock()
++	base.panicNow = false
++	base.mu.Unlock()
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	if _, err := p.BuildRoute(ctx, route.RoutePoint{}, route.RoutePoint{}); err != nil {
++		t.Errorf("the slot leaked after a panic: %v", err)
++	}
++}
+diff --git a/internal/repository/postgres/chargingStation.go b/internal/repository/postgres/chargingStation.go
+index b2597d8..d3671ad 100644
+--- a/internal/repository/postgres/chargingStation.go
++++ b/internal/repository/postgres/chargingStation.go
+@@ -9,20 +9,38 @@ import (
+ 	"github.com/jackc/pgx/v5"
+ )
+ 
+-func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon float64, radiusMeters float64) ([]station.ChargingStation, error) {
+-	query := `
+-    SELECT
++// FindNearbyStations возвращает работающие станции в радиусе radiusMeters от точки: ближайшие первыми,
++// при равном расстоянии по id (порядок стабилен), не больше limit штук.
++//
++// Если connectors не пуст, остаются только станции хотя бы с одним из этих разъёмов (точное совпадение строк).
++// Фильтр по разъёму и LIMIT выполняются в SQL, чтобы в плотной зоне в Go не приезжали тысячи станций,
++// из которых нужны единицы. Поиск по-прежнему ограничен радиусом через ST_DWithin (индекс GiST): чистый kNN
++// без ограничения радиусом при редком разъёме обходил бы весь индекс.
++func (r *Repository) FindNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error) {
++	if limit <= 0 {
++		return nil, fmt.Errorf("find nearby stations: limit must be positive, got %d", limit)
++	}
++	if connectors == nil {
++		connectors = []string{} // pgx передал бы nil как NULL, а cardinality(NULL) не равно 0
++	}
++
++	const query = `
++		SELECT
+ 			id,
+ 			name,
+-        	ST_Y(location::geometry) as latitude,
+-        	ST_X(location::geometry) as longitude,
+-        	power_kw, connector_types, is_operational
+-    FROM charging_stations
+-    WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint($1,$2),4326)::geography, $3)
+-      AND is_operational = true
+-    ORDER BY ST_Distance(location, ST_SetSRID(ST_MakePoint($1,$2),4326)::geography);`
+-
+-	rows, err := r.db.Query(ctx, query, lon, lat, radiusMeters)
++			ST_Y(location::geometry) AS latitude,
++			ST_X(location::geometry) AS longitude,
++			power_kw,
++			connector_types,
++			is_operational
++		FROM charging_stations
++		WHERE is_operational
++		  AND ST_DWithin(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)
++		  AND (cardinality($4::text[]) = 0 OR connector_types && $4::text[])
++		ORDER BY ST_Distance(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography), id
++		LIMIT $5`
++
++	rows, err := r.db.Query(ctx, query, lon, lat, radiusMeters, connectors, limit)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to query nearby stations: %w", err)
+ 	}
+diff --git a/internal/repository/postgres/repository_integration_test.go b/internal/repository/postgres/repository_integration_test.go
+index 02153ee..a65ec2e 100644
+--- a/internal/repository/postgres/repository_integration_test.go
++++ b/internal/repository/postgres/repository_integration_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"slices"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -14,6 +15,7 @@ import (
+ 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
+ 	"github.com/IvanLobanok/evnavigation/internal/models/history"
+ 	"github.com/IvanLobanok/evnavigation/internal/models/route"
++	"github.com/IvanLobanok/evnavigation/internal/models/station"
+ 	"github.com/IvanLobanok/evnavigation/internal/models/user"
+ 	"github.com/jackc/pgx/v5/pgxpool"
+ )
+@@ -305,7 +307,7 @@ func TestStations_FindNearby(t *testing.T) {
+ 	ctx := context.Background()
+ 	id, lat, lon := seededStation(t, pool)
+ 
+-	found, err := r.FindNearbyStations(ctx, lat, lon, 100)
++	found, err := r.FindNearbyStations(ctx, lat, lon, 100, nil, 100)
+ 	if err != nil {
+ 		t.Fatalf("FindNearbyStations: %v", err)
+ 	}
+@@ -331,7 +333,7 @@ func TestStations_FindNearbyIsSortedByDistance(t *testing.T) {
+ 	ctx := context.Background()
+ 	_, lat, lon := seededStation(t, pool)
+ 
+-	found, err := r.FindNearbyStations(ctx, lat, lon, 30_000)
++	found, err := r.FindNearbyStations(ctx, lat, lon, 30_000, nil, 1000)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -360,14 +362,14 @@ func TestStations_RadiusIsRespected(t *testing.T) {
+ 	ctx := context.Background()
+ 
+ 	// (0, 0) — Гвинейский залив: станций там нет
+-	if found, err := r.FindNearbyStations(ctx, 0, 0, 50_000); err != nil || len(found) != 0 {
++	if found, err := r.FindNearbyStations(ctx, 0, 0, 50_000, nil, 100); err != nil || len(found) != 0 {
+ 		t.Errorf("far from every station: got %d stations, err=%v", len(found), err)
+ 	}
+ 
+ 	// чем больше радиус, тем не меньше станций
+ 	_, lat, lon := seededStation(t, pool)
+-	small, err1 := r.FindNearbyStations(ctx, lat, lon, 100)
+-	large, err2 := r.FindNearbyStations(ctx, lat, lon, 50_000)
++	small, err1 := r.FindNearbyStations(ctx, lat, lon, 100, nil, 1000)
++	large, err2 := r.FindNearbyStations(ctx, lat, lon, 50_000, nil, 1000)
+ 	if err1 != nil || err2 != nil {
+ 		t.Fatalf("errors: %v %v", err1, err2)
+ 	}
+@@ -391,7 +393,7 @@ func TestStations_InactiveStationsAreHidden(t *testing.T) {
+ 	}
+ 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM charging_stations WHERE id = $1`, inactiveID) })
+ 
+-	found, err := r.FindNearbyStations(ctx, lat, lon, 1000)
++	found, err := r.FindNearbyStations(ctx, lat, lon, 1000, nil, 100)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -562,3 +564,143 @@ func TestRouteRequests_UnknownVehicleIsRejected(t *testing.T) {
+ 		t.Fatal("a request for a non-existent vehicle must be rejected by the foreign key")
+ 	}
+ }
++
++// insertTestStation создаёт станцию с заданными разъёмами и удаляет её в t.Cleanup.
++func insertTestStation(t *testing.T, pool *pgxpool.Pool, lat, lon float64, connectors ...string) int64 {
++	t.Helper()
++	if connectors == nil {
++		connectors = []string{} // колонка NOT NULL: «без разъёмов» это пустой массив, а не NULL
++	}
++	var id int64
++	err := pool.QueryRow(context.Background(), `
++		INSERT INTO charging_stations (name, location, connector_types, power_kw)
++		VALUES ('integration-test station', ST_SetSRID(ST_MakePoint($1,$2),4326)::geography, $3, 50)
++		RETURNING id`, lon, lat, connectors).Scan(&id)
++	if err != nil {
++		t.Fatalf("insert station: %v", err)
++	}
++	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM charging_stations WHERE id = $1`, id) })
++	return id
++}
++
++func stationIDs(list []station.ChargingStation) []int64 {
++	out := make([]int64, 0, len(list))
++	for _, s := range list {
++		out = append(out, s.ID)
++	}
++	return out
++}
++
++// Точка (0, 0) — Гвинейский залив: сид-станций рядом нет, поэтому тесты ниже видят только свои станции.
++
++func TestStations_ConnectorFilter(t *testing.T) {
++	r, pool := newTestRepo(t)
++	ctx := context.Background()
++	a := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
++	b := insertTestStation(t, pool, 0, 0.0020, "it-conn-B")
++	ab := insertTestStation(t, pool, 0, 0.0030, "it-conn-A", "it-conn-B")
++	none := insertTestStation(t, pool, 0, 0.0040) // без разъёмов
++
++	tests := []struct {
++		name       string
++		connectors []string
++		want       []int64
++	}{
++		{"nil filter returns everything", nil, []int64{a, b, ab, none}},
++		{"empty filter returns everything", []string{}, []int64{a, b, ab, none}},
++		{"single connector", []string{"it-conn-A"}, []int64{a, ab}},
++		{"station with several connectors matches by any of them", []string{"it-conn-B"}, []int64{b, ab}},
++		{"several preferred connectors: any of them is enough", []string{"it-conn-A", "it-conn-B"}, []int64{a, b, ab}},
++		{"unknown connector matches nothing", []string{"it-conn-none"}, []int64{}},
++		{"matching is exact and case-sensitive", []string{"IT-CONN-A"}, []int64{}},
++		{"a station without connectors never matches a filter", []string{""}, []int64{}},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := r.FindNearbyStations(ctx, 0, 0, 5_000, tc.connectors, 100)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !slices.Equal(stationIDs(got), tc.want) {
++				t.Errorf("got %v, want %v", stationIDs(got), tc.want)
++			}
++		})
++	}
++}
++
++func TestStations_LimitKeepsTheNearest(t *testing.T) {
++	r, pool := newTestRepo(t)
++	ctx := context.Background()
++	far := insertTestStation(t, pool, 0, 0.0030, "it-conn-A")
++	near := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
++	mid := insertTestStation(t, pool, 0, 0.0020, "it-conn-A")
++
++	got, err := r.FindNearbyStations(ctx, 0, 0, 5_000, []string{"it-conn-A"}, 2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !slices.Equal(stationIDs(got), []int64{near, mid}) {
++		t.Errorf("limit 2 must keep the two nearest in order, got %v (far=%d)", stationIDs(got), far)
++	}
++
++	all, err := r.FindNearbyStations(ctx, 0, 0, 5_000, []string{"it-conn-A"}, 100)
++	if err != nil || !slices.Equal(stationIDs(all), []int64{near, mid, far}) {
++		t.Errorf("limit above the count returns all: got %v err=%v", stationIDs(all), err)
++	}
++}
++
++func TestStations_EqualDistanceIsOrderedByID(t *testing.T) {
++	r, pool := newTestRepo(t)
++	first := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
++	second := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
++	third := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
++
++	for i := 0; i < 5; i++ { // порядок не должен «плавать» между запросами
++		got, err := r.FindNearbyStations(context.Background(), 0, 0, 5_000, []string{"it-conn-A"}, 100)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !slices.Equal(stationIDs(got), []int64{first, second, third}) {
++			t.Fatalf("run %d: got %v, want ids ascending %v", i, stationIDs(got), []int64{first, second, third})
++		}
++	}
++}
++
++func TestStations_RadiusAppliesWithConnectorFilterAndLimit(t *testing.T) {
++	r, pool := newTestRepo(t)
++	inside := insertTestStation(t, pool, 0, 0.0100, "it-conn-A") // ~1.1 км
++	_ = insertTestStation(t, pool, 0, 0.1000, "it-conn-A")       // ~11 км: за пределами радиуса 5 км
++
++	got, err := r.FindNearbyStations(context.Background(), 0, 0, 5_000, []string{"it-conn-A"}, 100)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !slices.Equal(stationIDs(got), []int64{inside}) {
++		t.Errorf("only the station inside the radius expected, got %v", stationIDs(got))
++	}
++}
++
++func TestStations_LimitMustBePositive(t *testing.T) {
++	r, _ := newTestRepo(t)
++	for _, limit := range []int{0, -1} {
++		if _, err := r.FindNearbyStations(context.Background(), 0, 0, 1000, nil, limit); err == nil {
++			t.Errorf("limit %d must be rejected", limit)
++		}
++	}
++}
++
++func TestSchema_PerformanceIndexesExist(t *testing.T) {
++	_, pool := newTestRepo(t)
++	for _, name := range []string{
++		"idx_user_vehicles_user_id",
++		"idx_route_requests_user_vehicle_id",
++		"idx_charging_stations_location",
++		"users_email_lower_idx",
++	} {
++		var exists bool
++		err := pool.QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1)`, name).Scan(&exists)
++		if err != nil || !exists {
++			t.Errorf("index %s is missing (err=%v)", name, err)
++		}
++	}
++}
+diff --git a/internal/service/auth/auth.go b/internal/service/auth/auth.go
+index 5f61c45..b4922e7 100644
+--- a/internal/service/auth/auth.go
++++ b/internal/service/auth/auth.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/mail"
++	"runtime"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+@@ -25,6 +26,10 @@ const (
+ var (
+ 	ErrInvalidCredentials = errors.New("invalid email or password")
+ 	ErrInvalidToken       = errors.New("invalid or expired token")
++
++	// ErrBusy: все слоты хэширования паролей заняты, а время ожидания запроса вышло.
++	// bcrypt нагружает процессор, и без ограничения число одновременных хэшей определяет любой желающий.
++	ErrBusy = errors.New("too many password hashes in progress")
+ )
+ 
+ // ValidationError описывает некорректные поля регистрации.
+@@ -44,6 +49,11 @@ type Config struct {
+ 	Secret     []byte        // ключ подписи HS256
+ 	TTL        time.Duration // срок жизни access-токена
+ 	BcryptCost int           // 0 => bcrypt.DefaultCost
++
++	// BcryptMaxConcurrent - сколько bcrypt-операций (регистрация, логин) выполняются одновременно;
++	// остальные ждут слот, пока не истечёт контекст запроса. 0 => runtime.GOMAXPROCS(0): больше хэшей одновременно
++	// не ускоряют работу, а только отбирают процессор у остальных запросов.
++	BcryptMaxConcurrent int
+ }
+ 
+ type Service struct {
+@@ -53,6 +63,8 @@ type Service struct {
+ 	cost      int
+ 	now       func() time.Time
+ 	dummyHash []byte // для выравнивания времени ответа, когда пользователя нет
++
++	hashSlots chan struct{} // семафор: сколько bcrypt-операций можно выполнять одновременно
+ }
+ 
+ func NewService(store UserStore, cfg Config) (*Service, error) {
+@@ -70,6 +82,14 @@ func NewService(store UserStore, cfg Config) (*Service, error) {
+ 		return nil, fmt.Errorf("bcrypt cost must be between %d and %d", bcrypt.MinCost, bcrypt.MaxCost)
+ 	}
+ 
++	if cfg.BcryptMaxConcurrent < 0 {
++		return nil, errors.New("bcrypt max concurrency must not be negative")
++	}
++	slots := cfg.BcryptMaxConcurrent
++	if slots == 0 {
++		slots = runtime.GOMAXPROCS(0)
++	}
++
+ 	dummy, err := bcrypt.GenerateFromPassword([]byte("timing-equalizer"), cost)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("prepare dummy hash: %w", err)
+@@ -82,9 +102,23 @@ func NewService(store UserStore, cfg Config) (*Service, error) {
+ 		cost:      cost,
+ 		now:       time.Now,
+ 		dummyHash: dummy,
++		hashSlots: make(chan struct{}, slots),
+ 	}, nil
+ }
+ 
++// withHashSlot выполняет fn (bcrypt-операцию), когда освободится слот. Пока слота нет, ждёт, но не дольше контекста
++// запроса: тогда возвращает ErrBusy, а fn не вызывается.
++func (s *Service) withHashSlot(ctx context.Context, fn func()) error {
++	select {
++	case s.hashSlots <- struct{}{}:
++	case <-ctx.Done():
++		return ErrBusy
++	}
++	defer func() { <-s.hashSlots }()
++	fn()
++	return nil
++}
++
+ // ---------------------------------------------------------------------------
+ // Регистрация
+ // ---------------------------------------------------------------------------
+@@ -103,9 +137,15 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (*user.User, e
+ 		return nil, &ValidationError{Fields: fields}
+ 	}
+ 
+-	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), s.cost)
+-	if err != nil {
+-		return nil, fmt.Errorf("hash password: %w", err)
++	var (
++		hash    []byte
++		hashErr error
++	)
++	if err := s.withHashSlot(ctx, func() { hash, hashErr = bcrypt.GenerateFromPassword([]byte(in.Password), s.cost) }); err != nil {
++		return nil, err
++	}
++	if hashErr != nil {
++		return nil, fmt.Errorf("hash password: %w", hashErr)
+ 	}
+ 
+ 	createdAt := s.now().UTC()
+@@ -165,13 +205,19 @@ func (s *Service) Login(ctx context.Context, email, password string) (*Token, er
+ 	if err != nil {
+ 		if errors.Is(err, user.ErrNotFound) {
+ 			// всё равно считаем bcrypt, чтобы по времени ответа нельзя было отличить «нет такого email»
+-			_ = bcrypt.CompareHashAndPassword(s.dummyHash, []byte(password))
++			if err := s.withHashSlot(ctx, func() { _ = bcrypt.CompareHashAndPassword(s.dummyHash, []byte(password)) }); err != nil {
++				return nil, err
++			}
+ 			return nil, ErrInvalidCredentials
+ 		}
+ 		return nil, fmt.Errorf("get user: %w", err)
+ 	}
+ 
+-	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
++	var cmpErr error
++	if err := s.withHashSlot(ctx, func() { cmpErr = bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) }); err != nil {
++		return nil, err
++	}
++	if cmpErr != nil {
+ 		return nil, ErrInvalidCredentials
+ 	}
+ 
+diff --git a/internal/service/auth/auth_test.go b/internal/service/auth/auth_test.go
+index 61e9c72..98551a9 100644
+--- a/internal/service/auth/auth_test.go
++++ b/internal/service/auth/auth_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -86,6 +87,8 @@ func TestNewService_ConfigValidation(t *testing.T) {
+ 		{"negative ttl", Config{Secret: testSecret, TTL: -time.Second}, true},
+ 		{"cost too low", Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MinCost - 1}, true},
+ 		{"cost too high", Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MaxCost + 1}, true},
++		{"explicit hash concurrency", Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MinCost, BcryptMaxConcurrent: 2}, false},
++		{"negative hash concurrency", Config{Secret: testSecret, TTL: time.Hour, BcryptMaxConcurrent: -1}, true},
+ 	}
+ 	for _, tc := range tests {
+ 		t.Run(tc.name, func(t *testing.T) {
+@@ -426,3 +429,114 @@ func TestParseToken_ExpiryBoundary(t *testing.T) {
+ 		t.Errorf("token must be rejected after exp, got %v", err)
+ 	}
+ }
++
++// ---------------------------------------------------------------------------
++// Ограничение числа одновременных bcrypt-операций
++// ---------------------------------------------------------------------------
++
++func newLimitedService(t *testing.T, store *memStore, slots int) *Service {
++	t.Helper()
++	svc, err := NewService(store, Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MinCost, BcryptMaxConcurrent: slots})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return svc
++}
++
++func TestHashSlots_DefaultIsPositive(t *testing.T) {
++	svc := newTestService(t, newMemStore())
++	if cap(svc.hashSlots) < 1 {
++		t.Errorf("default number of hash slots must be at least 1, got %d", cap(svc.hashSlots))
++	}
++}
++
++func TestWithHashSlot_LimitsConcurrency(t *testing.T) {
++	svc := newLimitedService(t, newMemStore(), 2)
++
++	var mu sync.Mutex
++	running, peak := 0, 0
++	var wg sync.WaitGroup
++	for i := 0; i < 12; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			err := svc.withHashSlot(context.Background(), func() {
++				mu.Lock()
++				running++
++				peak = max(peak, running)
++				mu.Unlock()
++				time.Sleep(10 * time.Millisecond)
++				mu.Lock()
++				running--
++				mu.Unlock()
++			})
++			if err != nil {
++				t.Errorf("unexpected error: %v", err)
++			}
++		}()
++	}
++	wg.Wait()
++
++	if peak > 2 {
++		t.Errorf("up to %d operations ran at once, limit is 2", peak)
++	}
++	if peak < 2 {
++		t.Errorf("the limit must allow full use of the slots: peak was %d", peak)
++	}
++}
++
++func TestWithHashSlot_ReleasesTheSlotEvenAfterPanic(t *testing.T) {
++	svc := newLimitedService(t, newMemStore(), 1)
++
++	func() {
++		defer func() { _ = recover() }()
++		_ = svc.withHashSlot(context.Background(), func() { panic("boom") })
++	}()
++
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	if err := svc.withHashSlot(ctx, func() {}); err != nil {
++		t.Errorf("the slot was not released after a panic: %v", err)
++	}
++}
++
++func TestLoginAndRegister_ReturnBusyWhenNoSlotIsFreeInTime(t *testing.T) {
++	store := newMemStore()
++	svc := newLimitedService(t, store, 1)
++	if _, err := svc.Register(context.Background(), RegisterInput{Name: "Ann", Email: "ann@example.com", Password: "correct horse"}); err != nil {
++		t.Fatal(err)
++	}
++
++	svc.hashSlots <- struct{}{} // единственный слот занят «чужим» хэшем
++
++	short := func() (context.Context, context.CancelFunc) {
++		return context.WithTimeout(context.Background(), 30*time.Millisecond)
++	}
++
++	ctx, cancel := short()
++	if _, err := svc.Login(ctx, "ann@example.com", "correct horse"); !errors.Is(err, ErrBusy) {
++		t.Errorf("login with a known user: got %v, want ErrBusy", err)
++	}
++	cancel()
++
++	ctx, cancel = short()
++	if _, err := svc.Login(ctx, "nobody@example.com", "whatever12"); !errors.Is(err, ErrBusy) {
++		t.Errorf("login with an unknown user must also wait for a slot (timing equalizer): got %v, want ErrBusy", err)
++	}
++	cancel()
++
++	before := store.createCalls
++	ctx, cancel = short()
++	if _, err := svc.Register(ctx, RegisterInput{Name: "Bob", Email: "bob@example.com", Password: "correct horse"}); !errors.Is(err, ErrBusy) {
++		t.Errorf("register: got %v, want ErrBusy", err)
++	}
++	cancel()
++	if store.createCalls != before {
++		t.Error("a busy registration must not reach the store")
++	}
++
++	<-svc.hashSlots // слот освободился: всё снова работает
++	if _, err := svc.Login(context.Background(), "ann@example.com", "correct horse"); err != nil {
++		t.Errorf("login after the slot was freed: %v", err)
++	}
++}
+diff --git a/internal/service/routing/routing.go b/internal/service/routing/routing.go
+index e0832c0..a4e5f66 100644
+--- a/internal/service/routing/routing.go
++++ b/internal/service/routing/routing.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"maps"
+ 	"math"
++	"sync"
+ 
+ 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
+ 	"github.com/IvanLobanok/evnavigation/internal/models/route"
+@@ -19,8 +20,9 @@ var (
+ )
+ 
+ // StationFinder - интерфейс для поиска зарядных станций (изолирует базу данных / репозиторий).
++// Возвращает работающие станции с хотя бы одним из preferredConnectors, ближайшие первыми, не больше limit штук.
+ type StationFinder interface {
+-	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error)
++	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string, limit int) ([]station.ChargingStation, error)
+ }
+ 
+ // Config содержит все константы и параметры для симуляции и построения маршрута.
+@@ -33,6 +35,13 @@ type Config struct {
+ 	MaxStationCandidates  int     // Максимальное количество станций для одновременной проверки
+ 	LookbackStepKm        float64 // Шаг сканирования назад по маршруту при поиске станции
+ 	MaxLookbackKm         float64 // Максимальная глубина отката назад в км
++
++	// CandidateParallelism: сколько станций-кандидатов проверять одновременно (каждая проверка - вызов провайдера маршрутов).
++	// 0 и 1 - по одной, как раньше: меньше вызовов платного провайдера, но дольше ждать.
++	// Больше 1 - быстрее ответ, но кандидаты шага отката проверяются сразу все, а не до первой удачной: вызовов провайдера
++	// становится больше (часть из них отменяется, если ближайшая станция успела ответить раньше).
++	// Результат от значения не зависит: побеждает первый по порядку (ближайший) достижимый кандидат.
++	CandidateParallelism int
+ }
+ 
+ // RouteService реализует бизнес-логику построения и симуляции электромобильных маршрутов.
+@@ -56,6 +65,9 @@ func NewService(routeProvider route.RouteProvider, stationFinder StationFinder,
+ 	if c.MaxStops <= 0 || c.MaxStationCandidates <= 0 {
+ 		return nil, errors.New("max stops and candidates must be positive")
+ 	}
++	if c.CandidateParallelism < 0 {
++		return nil, errors.New("candidate parallelism must not be negative")
++	}
+ 	return &RouteService{
+ 		routeProvider: routeProvider,
+ 		stationFinder: stationFinder,
+@@ -221,6 +233,10 @@ func (s *RouteService) analyzeRoute(ctx context.Context, from, to route.RoutePoi
+ 	return analysis, nil
+ }
+ 
++// straightLineSlack: нижняя оценка длины пути до станции - это 97% расстояния по прямой.
++// Дорога не бывает короче прямой, а 3% запаса прощают провайдерам и тестовым данным с чуть иным радиусом Земли.
++const straightLineSlack = 0.97
++
+ // findReachableStation реализует стратегию "Lookback" (откат назад от критической точки).
+ // Если впереди батарея разряжается, метод идет назад по точкам маршрута, ищет станции в радиусе
+ // и проверяет физическую достижимость каждой из них с учетом минимального безопасного остатка.
+@@ -247,8 +263,11 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
+ 		}
+ 		lastSearchKm = p.CumulativeDistanceKm
+ 
+-		// Ищем доступные станции в окрестности текущей точки отката
+-		found, err := s.stationFinder.GetAvailableNearbyStations(ctx, p.Point.Lat, p.Point.Lon, s.config.SearchRadiusMeters, []string{ev.ConnectorType})
++		// Ищем доступные станции в окрестности текущей точки отката. Фильтр по разъёму и ограничение числа строк
++		// выполняет база: уже опробованные станции (tried) отсеиваются здесь, поэтому просим MaxStationCandidates + len(tried) -
++		// даже если все опробованные окажутся ближе всех, свежих кандидатов хватит.
++		limit := s.config.MaxStationCandidates + len(tried)
++		found, err := s.stationFinder.GetAvailableNearbyStations(ctx, p.Point.Lat, p.Point.Lon, s.config.SearchRadiusMeters, []string{ev.ConnectorType}, limit)
+ 		if err != nil {
+ 			return station.ChargingStation{}, nil, fmt.Errorf("find stations: %w", err)
+ 		}
+@@ -266,20 +285,17 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
+ 		if len(fresh) > 0 {
+ 			foundAny = true
+ 		}
+-
+-		// Проверяем каждого кандидата на физическую достижимость с текущим зарядом
+ 		for _, c := range fresh {
+ 			tried[c.ID] = struct{}{}
++		}
+ 
+-			// Строим подмаршрут до станции и симулируем поездку к ней
+-			leg, err := s.analyzeRoute(ctx, current, route.RoutePoint{Lat: c.Latitude, Lon: c.Longitude}, ev, charge)
+-			if err != nil {
+-				return station.ChargingStation{}, nil, err
+-			}
+-			// Если доехали и остаток заряда выше или равен минимальному порогу приезда - станция найдена!
+-			if leg.last().RemainingBatteryPercent >= s.config.MinArrivalPercent {
+-				return c, leg, nil
+-			}
++		// Проверяем кандидатов на физическую достижимость с текущим зарядом
++		c, leg, ok, err := s.firstReachable(ctx, current, fresh, ev, charge)
++		if err != nil {
++			return station.ChargingStation{}, nil, err
++		}
++		if ok {
++			return c, leg, nil
+ 		}
+ 	}
+ 
+@@ -289,3 +305,150 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
+ 	}
+ 	return station.ChargingStation{}, nil, ErrNoStationNearby // Вблизи критической зоны вообще нет станций
+ }
++
++// candidateResult - итог проверки одного кандидата.
++type candidateResult struct {
++	leg *RouteAnalysis
++	err error
++}
++
++// firstReachable возвращает первую по порядку станцию, до которой хватает заряда, вместе с участком пути к ней.
++// ok == false без ошибки значит, что ни одна из станций недостижима.
++//
++// Сначала отсеиваются станции, до которых не доехать даже по прямой: для них не нужен вызов провайдера маршрутов.
++// Остальные проверяются по одной или параллельно (CandidateParallelism); выбор от этого не зависит.
++func (s *RouteService) firstReachable(ctx context.Context, current route.RoutePoint, candidates []station.ChargingStation, ev evmodel.EVModel, charge float64) (st station.ChargingStation, leg *RouteAnalysis, ok bool, err error) {
++	viable := make([]station.ChargingStation, 0, len(candidates))
++	for _, c := range candidates {
++		if !s.hopeless(current, route.RoutePoint{Lat: c.Latitude, Lon: c.Longitude}, ev, charge) {
++			viable = append(viable, c)
++		}
++	}
++	if len(viable) == 0 {
++		return station.ChargingStation{}, nil, false, nil
++	}
++
++	// Строим подмаршрут до станции и симулируем поездку к ней.
++	check := func(ctx context.Context, c station.ChargingStation) (*RouteAnalysis, error) {
++		return s.analyzeRoute(ctx, current, route.RoutePoint{Lat: c.Latitude, Lon: c.Longitude}, ev, charge)
++	}
++	// Если доехали и остаток заряда выше или равен минимальному порогу приезда - станция найдена!
++	reached := func(a *RouteAnalysis) bool {
++		return a.last().RemainingBatteryPercent >= s.config.MinArrivalPercent
++	}
++
++	if s.config.CandidateParallelism <= 1 || len(viable) == 1 {
++		for _, c := range viable {
++			a, err := check(ctx, c)
++			if err != nil {
++				return station.ChargingStation{}, nil, false, err
++			}
++			if reached(a) {
++				return c, a, true, nil
++			}
++		}
++		return station.ChargingStation{}, nil, false, nil
++	}
++
++	// Параллельная проверка. Каждый кандидат получает свой контекст: когда найден достижимый кандидат с индексом i,
++	// кандидаты правее него уже не могут победить, и их проверки отменяются, а кандидаты левее продолжают -
++	// среди них может найтись более близкая станция, которая должна победить, как и при последовательной проверке.
++	results := make([]candidateResult, len(viable))
++	ctxs := make([]context.Context, len(viable))
++	cancels := make([]context.CancelFunc, len(viable))
++	for i := range viable {
++		ctxs[i], cancels[i] = context.WithCancel(ctx)
++	}
++	defer func() {
++		for _, cancel := range cancels {
++			cancel()
++		}
++	}()
++
++	var (
++		mu   sync.Mutex
++		best = len(viable) // наименьший индекс кандидата, про которого уже известно, что он достижим
++		sem  = make(chan struct{}, s.config.CandidateParallelism)
++		wg   sync.WaitGroup
++	)
++	for i := range viable {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			// Паника в горутине не попадает под chi Recoverer и уронила бы весь процесс, поэтому превращаем её в ошибку.
++			defer func() {
++				if r := recover(); r != nil {
++					results[i] = candidateResult{err: fmt.Errorf("check station %d: panic: %v", viable[i].ID, r)}
++				}
++			}()
++
++			sem <- struct{}{}
++			defer func() { <-sem }()
++
++			mu.Lock()
++			superseded := i > best
++			mu.Unlock()
++			if superseded || ctxs[i].Err() != nil {
++				err := ctxs[i].Err()
++				if err == nil {
++					err = context.Canceled
++				}
++				results[i] = candidateResult{err: err}
++				return
++			}
++
++			a, err := check(ctxs[i], viable[i])
++			results[i] = candidateResult{leg: a, err: err}
++			if err == nil && reached(a) {
++				mu.Lock()
++				if i < best {
++					best = i
++					for j := i + 1; j < len(viable); j++ {
++						cancels[j]()
++					}
++				}
++				mu.Unlock()
++			}
++		}(i)
++	}
++	wg.Wait()
++
++	// Читаем результаты в порядке кандидатов - ровно так же, как делала последовательная проверка.
++	// Отменённые нами кандидаты стоят правее победителя, до них дело не доходит.
++	for i, c := range viable {
++		res := results[i]
++		if res.err != nil {
++			return station.ChargingStation{}, nil, false, res.err
++		}
++		if res.leg == nil {
++			return station.ChargingStation{}, nil, false, fmt.Errorf("check station %d: no result", c.ID)
++		}
++		if reached(res.leg) {
++			return c, res.leg, true, nil
++		}
++	}
++	return station.ChargingStation{}, nil, false, nil
++}
++
++// hopeless сообщает, что до точки to заведомо не доехать с зарядом charge: даже по прямой (кратчайший из возможных путей)
++// остаток при прибытии окажется ниже MinArrivalPercent. Это отсев без обращения к провайдеру маршрутов.
++// Данные, которые не прошли бы проверку в analyzeRoute, не отсеиваются: пусть ошибку вернёт он.
++func (s *RouteService) hopeless(from, to route.RoutePoint, ev evmodel.EVModel, charge float64) bool {
++	if ev.BatteryCapacityKwh <= 0 || charge < 0 || charge > 100 {
++		return false
++	}
++	minKm := greatCircleKm(from, to) * straightLineSlack
++	minUsedPercent := (minKm / 100) * ev.AvgConsumptionKwh100km / ev.BatteryCapacityKwh * 100
++	return charge-minUsedPercent < s.config.MinArrivalPercent
++}
++
++// greatCircleKm - расстояние по большому кругу между точками (формула гаверсинусов).
++func greatCircleKm(a, b route.RoutePoint) float64 {
++	const earthRadiusKm = 6371.0
++	rad := func(d float64) float64 { return d * math.Pi / 180 }
++	dLat := rad(b.Lat - a.Lat)
++	dLon := rad(b.Lon - a.Lon)
++	h := math.Sin(dLat/2)*math.Sin(dLat/2) +
++		math.Cos(rad(a.Lat))*math.Cos(rad(b.Lat))*math.Sin(dLon/2)*math.Sin(dLon/2)
++	return 2 * earthRadiusKm * math.Asin(math.Min(1, math.Sqrt(h)))
++}
+diff --git a/internal/service/routing/routing_test.go b/internal/service/routing/routing_test.go
+index 4b11ade..5f2596d 100644
+--- a/internal/service/routing/routing_test.go
++++ b/internal/service/routing/routing_test.go
+@@ -3,9 +3,13 @@ package routing
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"math"
+ 	"sort"
++	"strings"
++	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
+ 	"github.com/IvanLobanok/evnavigation/internal/models/route"
+@@ -29,15 +33,34 @@ func kmOf(p route.RoutePoint) float64 { return p.Lat * kmPerDeg }
+ var errBoom = errors.New("boom")
+ 
+ // fakeProvider строит прямой маршрут по меридиану, нарезая его на сегменты по stepKm.
++// Он потокобезопасен: при параллельной проверке кандидатов BuildRoute вызывается из нескольких горутин.
+ type fakeProvider struct {
++	mu    sync.Mutex
+ 	calls int
+ 	err   error
++
++	// detour умножает длину каждого сегмента (дорога длиннее прямой); 0 означает 1, то есть без изменений.
++	detour float64
++	// onCall вызывается в начале каждого BuildRoute: может ждать (с учётом ctx), вернуть ошибку или паниковать.
++	onCall func(ctx context.Context, from, to route.RoutePoint) error
+ }
+ 
+-func (f *fakeProvider) BuildRoute(_ context.Context, from, to route.RoutePoint) ([]route.RouteSegment, error) {
++func (f *fakeProvider) BuildRoute(ctx context.Context, from, to route.RoutePoint) ([]route.RouteSegment, error) {
++	f.mu.Lock()
+ 	f.calls++
+-	if f.err != nil {
+-		return nil, f.err
++	err, detour, onCall := f.err, f.detour, f.onCall
++	f.mu.Unlock()
++
++	if err != nil {
++		return nil, err
++	}
++	if onCall != nil {
++		if err := onCall(ctx, from, to); err != nil {
++			return nil, err
++		}
++	}
++	if detour == 0 {
++		detour = 1
+ 	}
+ 	a, b := kmOf(from), kmOf(to)
+ 	total := math.Abs(b - a)
+@@ -52,22 +75,28 @@ func (f *fakeProvider) BuildRoute(_ context.Context, from, to route.RoutePoint)
+ 		segs = append(segs, route.RouteSegment{
+ 			From:           pt(a + dir*done),
+ 			To:             pt(a + dir*(done+step)),
+-			DistanceMeters: step * 1000,
++			DistanceMeters: step * 1000 * detour,
+ 		})
+ 		done += step
+ 	}
+ 	return segs, nil
+ }
+ 
+-// fakeFinder ищет станции из заданного списка: по радиусу и разъёму, сортируя по расстоянию.
++// fakeFinder ищет станции из заданного списка: по радиусу и разъёму, сортируя по расстоянию и обрезая по limit
++// (как настоящий репозиторий, у которого фильтр и LIMIT выполняются в SQL).
+ type fakeFinder struct {
+ 	stations []station.ChargingStation
+ 	calls    int
+ 	err      error
++
++	gotConnectors [][]string // разъёмы каждого вызова
++	gotLimits     []int      // limit каждого вызова
+ }
+ 
+-func (f *fakeFinder) GetAvailableNearbyStations(_ context.Context, lat, _, radiusMeters float64, connectors []string) ([]station.ChargingStation, error) {
++func (f *fakeFinder) GetAvailableNearbyStations(_ context.Context, lat, _, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error) {
+ 	f.calls++
++	f.gotConnectors = append(f.gotConnectors, connectors)
++	f.gotLimits = append(f.gotLimits, limit)
+ 	if f.err != nil {
+ 		return nil, f.err
+ 	}
+@@ -86,6 +115,9 @@ func (f *fakeFinder) GetAvailableNearbyStations(_ context.Context, lat, _, radiu
+ 		items = append(items, item{st, d})
+ 	}
+ 	sort.SliceStable(items, func(i, j int) bool { return items[i].dist < items[j].dist })
++	if limit > 0 && len(items) > limit {
++		items = items[:limit]
++	}
+ 
+ 	out := make([]station.ChargingStation, 0, len(items))
+ 	for _, it := range items {
+@@ -359,39 +391,48 @@ func TestPlanRoute(t *testing.T) {
+ 		},
+ 	}
+ 
+-	for _, tc := range tests {
+-		t.Run(tc.name, func(t *testing.T) {
+-			cfg := testConfig()
+-			if tc.cfg != nil {
+-				tc.cfg(&cfg)
+-			}
+-			svc, _, _ := newTestService(t, cfg, tc.stations...)
++	// Результат не должен зависеть от того, проверяются кандидаты по одному или параллельно.
++	for _, parallelism := range []int{0, 1, 3} {
++		for _, tc := range tests {
++			t.Run(fmt.Sprintf("parallelism=%d/%s", parallelism, tc.name), func(t *testing.T) {
++				runPlanRouteCase(t, parallelism, tc.cfg, tc.stations, tc.startPct, tc.finishKm, tc.wantErr, tc.wantStopIDs, tc.wantLegs)
++			})
++		}
++	}
++}
+ 
+-			plan, err := svc.PlanRoute(context.Background(), pt(0), pt(tc.finishKm), testEV, tc.startPct)
++func runPlanRouteCase(t *testing.T, parallelism int, mutate func(*Config), stations []station.ChargingStation, startPct, finishKm float64, wantErr error, wantStopIDs []int64, wantLegs int) {
++	t.Helper()
++	cfg := testConfig()
++	if mutate != nil {
++		mutate(&cfg)
++	}
++	cfg.CandidateParallelism = parallelism
++	svc, _, _ := newTestService(t, cfg, stations...)
+ 
+-			if !errors.Is(err, tc.wantErr) {
+-				t.Fatalf("error: got %v, want %v", err, tc.wantErr)
+-			}
+-			if plan == nil {
+-				t.Fatal("plan must not be nil (partial plan is returned together with route errors)")
+-			}
+-			if len(plan.Legs) != tc.wantLegs {
+-				t.Errorf("legs: got %d, want %d", len(plan.Legs), tc.wantLegs)
+-			}
++	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(finishKm), testEV, startPct)
+ 
+-			var gotIDs []int64
+-			for _, s := range plan.Stops {
+-				gotIDs = append(gotIDs, s.Station.ID)
+-			}
+-			if len(gotIDs) != len(tc.wantStopIDs) {
+-				t.Fatalf("stops: got %v, want %v", gotIDs, tc.wantStopIDs)
+-			}
+-			for i := range gotIDs {
+-				if gotIDs[i] != tc.wantStopIDs[i] {
+-					t.Errorf("stop %d: got station %d, want %d", i, gotIDs[i], tc.wantStopIDs[i])
+-				}
+-			}
+-		})
++	if !errors.Is(err, wantErr) {
++		t.Fatalf("error: got %v, want %v", err, wantErr)
++	}
++	if plan == nil {
++		t.Fatal("plan must not be nil (partial plan is returned together with route errors)")
++	}
++	if len(plan.Legs) != wantLegs {
++		t.Errorf("legs: got %d, want %d", len(plan.Legs), wantLegs)
++	}
++
++	var gotIDs []int64
++	for _, s := range plan.Stops {
++		gotIDs = append(gotIDs, s.Station.ID)
++	}
++	if len(gotIDs) != len(wantStopIDs) {
++		t.Fatalf("stops: got %v, want %v", gotIDs, wantStopIDs)
++	}
++	for i := range gotIDs {
++		if gotIDs[i] != wantStopIDs[i] {
++			t.Errorf("stop %d: got station %d, want %d", i, gotIDs[i], wantStopIDs[i])
++		}
+ 	}
+ }
+ 
+@@ -426,7 +467,8 @@ func TestPlanRoute_OneStopDetails(t *testing.T) {
+ func TestPlanRoute_UnreachableStationIsCheckedOnlyOnce(t *testing.T) {
+ 	cfg := testConfig()
+ 	cfg.SearchRadiusMeters = 70000 // круги поиска в разных точках отката сильно перекрываются
+-	svc, prov, _ := newTestService(t, cfg, stn(1, 290))
++	svc, prov, _ := newTestService(t, cfg, stn(1, 250))
++	prov.detour = 1.2 // по прямой станция достижима (250 км < 275 км), но дорога на 20% длиннее, и заряда не хватает
+ 
+ 	_, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+ 	if !errors.Is(err, ErrStationUnreachable) {
+@@ -439,6 +481,273 @@ func TestPlanRoute_UnreachableStationIsCheckedOnlyOnce(t *testing.T) {
+ 	}
+ }
+ 
++func TestPlanRoute_HopelessStationDoesNotCostAProviderCall(t *testing.T) {
++	cfg := testConfig()
++	cfg.SearchRadiusMeters = 70000
++	// станция на 290-м км: 60% заряда хватает на 275 км, а прямой путь до неё уже длиннее - провайдер спрашивать незачем
++	svc, prov, _ := newTestService(t, cfg, stn(1, 290))
++
++	_, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++	if !errors.Is(err, ErrStationUnreachable) {
++		t.Fatalf("got %v, want ErrStationUnreachable (stations exist, but out of range)", err)
++	}
++	if prov.calls != 1 {
++		t.Errorf("provider calls: got %d, want 1 (only the whole-route analysis)", prov.calls)
++	}
++}
++
++func TestPlanRoute_PrefilterNeverRejectsAReachableStation(t *testing.T) {
++	// станция у самой границы достижимости по прямой: 60% - 5% = 55% = 275 км; станция на 270-м км достижима
++	cfg := testConfig()
++	cfg.SearchRadiusMeters = 70000
++	svc, _, _ := newTestService(t, cfg, stn(1, 270))
++
++	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++	if err != nil {
++		t.Fatalf("a reachable station must be found, got %v", err)
++	}
++	if len(plan.Stops) == 0 || plan.Stops[0].Station.ID != 1 {
++		t.Errorf("want a stop at station 1, got %+v", plan.Stops)
++	}
++}
++
++func TestPlanRoute_AsksFinderForConnectorAndEnoughRows(t *testing.T) {
++	cfg := testConfig()
++	cfg.SearchRadiusMeters = 70000
++	svc, _, f := newTestService(t, cfg, stn(1, 100), stn(2, 120), stn(3, 140))
++
++	if _, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60); err != nil && !errors.Is(err, ErrStationUnreachable) {
++		t.Fatal(err)
++	}
++	if f.calls == 0 {
++		t.Fatal("station finder was not called")
++	}
++	for i, got := range f.gotConnectors {
++		if len(got) != 1 || got[0] != testEV.ConnectorType {
++			t.Errorf("call %d: connectors %v, want [%s]: фильтр по разъёму должен уйти в базу", i, got, testEV.ConnectorType)
++		}
++	}
++	// limit = MaxStationCandidates + число уже опробованных станций: растёт вместе с откатом и не меньше MaxStationCandidates
++	for i, got := range f.gotLimits {
++		if got < cfg.MaxStationCandidates {
++			t.Errorf("call %d: limit %d is below MaxStationCandidates %d", i, got, cfg.MaxStationCandidates)
++		}
++	}
++	if f.gotLimits[0] != cfg.MaxStationCandidates {
++		t.Errorf("first call: limit %d, want %d (nothing has been tried yet)", f.gotLimits[0], cfg.MaxStationCandidates)
++	}
++}
++
++func TestPlanRoute_TriedStationsDoNotStarveNewCandidates(t *testing.T) {
++	// Много близких станций, до которых не доехать. Ближайшие к точке отката уже опробованы, но из-за запаса в limit
++	// (MaxStationCandidates + число опробованных) новые кандидаты всё равно доходят до проверки.
++	cfg := testConfig()
++	cfg.SearchRadiusMeters = 70000
++	cfg.MaxStationCandidates = 2
++	stations := []station.ChargingStation{stn(1, 285), stn(2, 286), stn(3, 287), stn(4, 288), stn(5, 225)}
++	svc, _, _ := newTestService(t, cfg, stations...)
++
++	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++	if err != nil {
++		t.Fatalf("station 5 is reachable and must be found despite the nearer unreachable ones: %v", err)
++	}
++	if plan.Stops[0].Station.ID != 5 {
++		t.Errorf("got station %d, want 5", plan.Stops[0].Station.ID)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Параллельная проверка кандидатов
++// ---------------------------------------------------------------------------
++
++func parallelConfig(parallelism int) Config {
++	cfg := testConfig()
++	cfg.SearchRadiusMeters = 70000
++	cfg.CandidateParallelism = parallelism
++	return cfg
++}
++
++// slowFor задерживает построение маршрутов до станции на заданной широте.
++func slowFor(slowKm float64, d time.Duration) func(context.Context, route.RoutePoint, route.RoutePoint) error {
++	return func(ctx context.Context, _, to route.RoutePoint) error {
++		if math.Abs(kmOf(to)-slowKm) > 1e-6 {
++			return nil
++		}
++		select {
++		case <-time.After(d):
++			return nil
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	}
++}
++
++func TestPlanRoute_ParallelPicksNearestReachableEvenIfLaterOneAnswersFirst(t *testing.T) {
++	// Первая точка поиска - критическая, 230-й км; станции идут от ближайшей к ней: 1 (229 км), затем 2 (228 км).
++	// Обе достижимы. Ответ о станции 1 приходит позже, чем о станции 2, но победить должна первая по порядку,
++	// как и при последовательной проверке.
++	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228))
++	prov.onCall = slowFor(229, 80*time.Millisecond)
++
++	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := plan.Stops[0].Station.ID; got != 1 {
++		t.Errorf("got station %d, want 1 (the nearer one wins regardless of response order)", got)
++	}
++}
++
++func TestPlanRoute_ParallelSameChoiceAsSequential(t *testing.T) {
++	stations := []station.ChargingStation{stn(1, 225), stn(2, 226), stn(3, 227), stn(4, 228)}
++	var chosen []int64
++	for _, par := range []int{1, 4} {
++		svc, _, _ := newTestService(t, parallelConfig(par), stations...)
++		plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++		if err != nil {
++			t.Fatal(err)
++		}
++		chosen = append(chosen, plan.Stops[0].Station.ID)
++	}
++	if chosen[0] != chosen[1] {
++		t.Errorf("sequential chose %d, parallel chose %d", chosen[0], chosen[1])
++	}
++}
++
++func TestPlanRoute_ParallelChecksCandidatesConcurrently(t *testing.T) {
++	// Все три кандидата должны оказаться «в полёте» одновременно: каждый вызов провайдера ждёт, пока начнут остальные.
++	// При последовательной проверке такой барьер никогда бы не открылся.
++	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228), stn(3, 227))
++
++	var started sync.WaitGroup
++	started.Add(3)
++	allStarted := make(chan struct{})
++	go func() { started.Wait(); close(allStarted) }()
++
++	prov.onCall = func(_ context.Context, _, to route.RoutePoint) error {
++		if kmOf(to) > 229.5 { // общий анализ маршрута и участок после станции проходят без ожидания
++			return nil
++		}
++		started.Done()
++		select {
++		case <-allStarted:
++			return nil
++		case <-time.After(2 * time.Second):
++			return errors.New("candidates were not checked concurrently")
++		}
++	}
++
++	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if plan.Stops[0].Station.ID != 1 {
++		t.Errorf("got station %d, want 1", plan.Stops[0].Station.ID)
++	}
++}
++
++func TestPlanRoute_ParallelismIsBounded(t *testing.T) {
++	var mu sync.Mutex
++	running, peak := 0, 0
++	svc, prov, _ := newTestService(t, func() Config { c := parallelConfig(2); c.MaxStationCandidates = 5; return c }(),
++		stn(1, 221), stn(2, 222), stn(3, 223), stn(4, 224), stn(5, 225))
++	prov.onCall = func(ctx context.Context, _, to route.RoutePoint) error {
++		if kmOf(to) > 226 { // общий анализ маршрута не считаем
++			return nil
++		}
++		mu.Lock()
++		running++
++		peak = max(peak, running)
++		mu.Unlock()
++		time.Sleep(20 * time.Millisecond)
++		mu.Lock()
++		running--
++		mu.Unlock()
++		return nil
++	}
++
++	if _, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60); err != nil {
++		t.Fatal(err)
++	}
++	if peak > 2 {
++		t.Errorf("up to %d checks ran at once, limit is 2", peak)
++	}
++}
++
++func TestPlanRoute_ParallelProviderErrorIsReturned(t *testing.T) {
++	// порядок кандидатов от критической точки (230-й км): станция 1 (229 км), 2 (228 км), 3 (227 км); все достижимы
++	failAt := func(km float64) func(context.Context, route.RoutePoint, route.RoutePoint) error {
++		return func(_ context.Context, _, to route.RoutePoint) error {
++			if math.Abs(kmOf(to)-km) < 1e-6 {
++				return errBoom
++			}
++			return nil
++		}
++	}
++
++	t.Run("failure to the right of the winner does not matter", func(t *testing.T) {
++		svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228), stn(3, 227))
++		prov.onCall = failAt(228) // станция 2; победитель - станция 1, как при последовательной проверке
++
++		plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++		if err != nil {
++			t.Fatalf("got %v", err)
++		}
++		if plan.Stops[0].Station.ID != 1 {
++			t.Errorf("got station %d, want 1", plan.Stops[0].Station.ID)
++		}
++	})
++
++	t.Run("failure to the left of the winner is returned", func(t *testing.T) {
++		svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228), stn(3, 227))
++		prov.onCall = failAt(229) // станция 1 идёт первой: последовательная проверка тоже споткнулась бы на ней
++
++		if _, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60); !errors.Is(err, errBoom) {
++			t.Errorf("got %v, want errBoom", err)
++		}
++	})
++}
++
++func TestPlanRoute_ParallelPanicBecomesError(t *testing.T) {
++	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228))
++	prov.onCall = func(_ context.Context, _, to route.RoutePoint) error {
++		if math.Abs(kmOf(to)-229) < 1e-6 {
++			panic("provider bug")
++		}
++		return nil
++	}
++
++	_, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
++	if err == nil || !strings.Contains(err.Error(), "panic") {
++		t.Fatalf("a panic inside a worker must come back as an error (not crash the process), got %v", err)
++	}
++}
++
++func TestPlanRoute_ParallelStopsWhenContextIsCancelled(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 225), stn(2, 226), stn(3, 227))
++	prov.onCall = func(ctx context.Context, _, to route.RoutePoint) error {
++		if kmOf(to) > 228 { // общий анализ маршрута проходит сразу
++			return nil
++		}
++		cancel()
++		<-ctx.Done()
++		return ctx.Err()
++	}
++
++	done := make(chan error, 1)
++	go func() { _, err := svc.PlanRoute(ctx, pt(0), pt(400), testEV, 60); done <- err }()
++
++	select {
++	case err := <-done:
++		if !errors.Is(err, context.Canceled) {
++			t.Errorf("got %v, want context.Canceled", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("PlanRoute did not return after the context was cancelled (leaked workers?)")
++	}
++}
++
+ func TestPlanRoute_NoStopMeansSingleProviderCall(t *testing.T) {
+ 	svc, prov, f := newTestService(t, testConfig(), stn(1, 228))
+ 
+diff --git a/internal/service/station/station.go b/internal/service/station/station.go
+index 4b625e5..0aaca10 100644
+--- a/internal/service/station/station.go
++++ b/internal/service/station/station.go
+@@ -3,13 +3,14 @@ package station
+ import (
+ 	"context"
+ 	"fmt"
+-	"slices"
+ 
+ 	"github.com/IvanLobanok/evnavigation/internal/models/station"
+ )
+ 
+ type Repository interface {
+-	FindNearbyStations(ctx context.Context, lat, lon, radiusMeters float64) ([]station.ChargingStation, error)
++	// FindNearbyStations: работающие станции в радиусе, ближайшие первыми, не больше limit штук;
++	// непустой connectors оставляет только станции хотя бы с одним из этих разъёмов.
++	FindNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error)
+ }
+ 
+ type Service struct {
+@@ -20,31 +21,13 @@ func NewService(repo Repository) *Service {
+ 	return &Service{repo: repo}
+ }
+ 
+-func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error) {
+-	stations, err := s.repo.FindNearbyStations(ctx, lat, lon, radiusMeters)
++// GetAvailableNearbyStations возвращает до limit ближайших работающих станций с подходящими разъёмами.
++// Фильтрация и ограничение числа строк выполняются в репозитории (в SQL), а не здесь:
++// так из базы не приезжают станции, которые всё равно будут отброшены.
++func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string, limit int) ([]station.ChargingStation, error) {
++	stations, err := s.repo.FindNearbyStations(ctx, lat, lon, radiusMeters, preferredConnectors, limit)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("station service error: %w", err)
+ 	}
+-
+-	if len(preferredConnectors) == 0 {
+-		return stations, nil
+-	}
+-
+-	var filtered []station.ChargingStation
+-	for _, st := range stations {
+-		if hasCommonConnector(preferredConnectors, st.ConnectorTypes) {
+-			filtered = append(filtered, st)
+-		}
+-	}
+-	return filtered, nil
+-
+-}
+-
+-func hasCommonConnector(preferred, available []string) bool {
+-	for _, v := range available {
+-		if slices.Contains(preferred, v) {
+-			return true
+-		}
+-	}
+-	return false
++	return stations, nil
+ }
+diff --git a/internal/service/station/station_test.go b/internal/service/station/station_test.go
+index 15e5bdb..2c7c009 100644
+--- a/internal/service/station/station_test.go
++++ b/internal/service/station/station_test.go
+@@ -3,6 +3,7 @@ package station
+ import (
+ 	"context"
+ 	"errors"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/IvanLobanok/evnavigation/internal/models/station"
+@@ -16,116 +17,50 @@ type fakeRepo struct {
+ 
+ 	calls                     int
+ 	gotLat, gotLon, gotRadius float64
++	gotConnectors             []string
++	gotLimit                  int
+ }
+ 
+-func (f *fakeRepo) FindNearbyStations(_ context.Context, lat, lon, radiusMeters float64) ([]station.ChargingStation, error) {
++func (f *fakeRepo) FindNearbyStations(_ context.Context, lat, lon, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error) {
+ 	f.calls++
+-	f.gotLat, f.gotLon, f.gotRadius = lat, lon, radiusMeters
++	f.gotLat, f.gotLon, f.gotRadius, f.gotConnectors, f.gotLimit = lat, lon, radiusMeters, connectors, limit
+ 	return f.stations, f.err
+ }
+ 
+-func st(id int64, connectors ...string) station.ChargingStation {
+-	return station.ChargingStation{ID: id, ConnectorTypes: connectors}
+-}
+-
+-func ids(list []station.ChargingStation) []int64 {
+-	out := make([]int64, 0, len(list))
+-	for _, s := range list {
+-		out = append(out, s.ID)
+-	}
+-	return out
+-}
+-
+-func equalIDs(got []station.ChargingStation, want ...int64) bool {
+-	g := ids(got)
+-	if len(g) != len(want) {
+-		return false
+-	}
+-	for i := range g {
+-		if g[i] != want[i] {
+-			return false
+-		}
+-	}
+-	return true
+-}
+-
+ func TestGetAvailableNearbyStations_PassesQueryToRepository(t *testing.T) {
+ 	repo := &fakeRepo{}
+-	_, err := NewService(repo).GetAvailableNearbyStations(context.Background(), 53.9, 27.5, 7500, nil)
++	_, err := NewService(repo).GetAvailableNearbyStations(context.Background(), 53.9, 27.5, 7500, []string{"CCS Combo 2", "Type 2"}, 13)
+ 
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if repo.calls != 1 || repo.gotLat != 53.9 || repo.gotLon != 27.5 || repo.gotRadius != 7500 {
+-		t.Errorf("repo got calls=%d lat=%v lon=%v radius=%v", repo.calls, repo.gotLat, repo.gotLon, repo.gotRadius)
+-	}
+-}
+-
+-func TestGetAvailableNearbyStations_ConnectorFilter(t *testing.T) {
+-	all := []station.ChargingStation{
+-		st(1, "CCS Combo 2"),
+-		st(2, "CHAdeMO"),
+-		st(3, "GB/T DC", "CCS Combo 2"),
+-		st(4), // без разъёмов
+-		st(5, "Type 2"),
+-		st(6, "CHAdeMO", "GB/T DC"),
+-	}
+-
+-	tests := []struct {
+-		name      string
+-		preferred []string
+-		want      []int64
+-	}{
+-		{"nil filter returns everything", nil, []int64{1, 2, 3, 4, 5, 6}},
+-		{"empty filter returns everything", []string{}, []int64{1, 2, 3, 4, 5, 6}},
+-		{"single connector", []string{"CCS Combo 2"}, []int64{1, 3}},
+-		{"station with several connectors matches by any of them", []string{"GB/T DC"}, []int64{3, 6}},
+-		{"several preferred connectors: any of them is enough", []string{"CHAdeMO", "Type 2"}, []int64{2, 5, 6}},
+-		{"unknown connector matches nothing", []string{"Tesla NACS"}, nil},
+-		{"matching is exact and case-sensitive", []string{"ccs combo 2"}, nil},
+-		{"a station without connectors never matches a filter", []string{""}, nil},
++	if repo.calls != 1 || repo.gotLat != 53.9 || repo.gotLon != 27.5 || repo.gotRadius != 7500 || repo.gotLimit != 13 {
++		t.Errorf("repo got calls=%d lat=%v lon=%v radius=%v limit=%d", repo.calls, repo.gotLat, repo.gotLon, repo.gotRadius, repo.gotLimit)
+ 	}
+-	for _, tc := range tests {
+-		t.Run(tc.name, func(t *testing.T) {
+-			got, err := NewService(&fakeRepo{stations: all}).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, tc.preferred)
+-
+-			if err != nil {
+-				t.Fatalf("unexpected error: %v", err)
+-			}
+-			if !equalIDs(got, tc.want...) {
+-				t.Errorf("got %v, want %v", ids(got), tc.want)
+-			}
+-		})
++	if !slices.Equal(repo.gotConnectors, []string{"CCS Combo 2", "Type 2"}) {
++		t.Errorf("connectors must reach the repository unchanged (filtering happens in SQL), got %v", repo.gotConnectors)
+ 	}
+ }
+ 
+-func TestGetAvailableNearbyStations_KeepsRepositoryOrder(t *testing.T) {
+-	// репозиторий отдаёт станции от ближайшей к дальней; фильтр не должен менять порядок
+-	repo := &fakeRepo{stations: []station.ChargingStation{st(9, "CCS Combo 2"), st(3, "CCS Combo 2"), st(7, "CCS Combo 2"), st(1, "CCS Combo 2")}}
++func TestGetAvailableNearbyStations_ReturnsRepositoryResultAsIs(t *testing.T) {
++	// репозиторий уже отфильтровал и отсортировал станции: сервис не должен ни убирать их, ни переставлять
++	repo := &fakeRepo{stations: []station.ChargingStation{{ID: 9}, {ID: 3}, {ID: 7}, {ID: 1}}}
+ 
+-	got, err := NewService(repo).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, []string{"CCS Combo 2"})
++	got, err := NewService(repo).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, []string{"CCS Combo 2"}, 10)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if !equalIDs(got, 9, 3, 7, 1) {
+-		t.Errorf("order changed: %v", ids(got))
+-	}
+-}
+-
+-func TestGetAvailableNearbyStations_DoesNotModifyRepositoryResult(t *testing.T) {
+-	original := []station.ChargingStation{st(1, "CHAdeMO"), st(2, "CCS Combo 2"), st(3, "CHAdeMO")}
+-	repo := &fakeRepo{stations: original}
+-
+-	if _, err := NewService(repo).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, []string{"CCS Combo 2"}); err != nil {
+-		t.Fatal(err)
++	var ids []int64
++	for _, s := range got {
++		ids = append(ids, s.ID)
+ 	}
+-	if !equalIDs(original, 1, 2, 3) {
+-		t.Errorf("filtering must not rewrite the slice it received: %v", ids(original))
++	if !slices.Equal(ids, []int64{9, 3, 7, 1}) {
++		t.Errorf("got %v, want [9 3 7 1]", ids)
+ 	}
+ }
+ 
+ func TestGetAvailableNearbyStations_NoStations(t *testing.T) {
+-	got, err := NewService(&fakeRepo{}).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, []string{"CCS Combo 2"})
++	got, err := NewService(&fakeRepo{}).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, []string{"CCS Combo 2"}, 5)
+ 
+ 	if err != nil || len(got) != 0 {
+ 		t.Errorf("got %d stations, err=%v", len(got), err)
+@@ -133,7 +68,7 @@ func TestGetAvailableNearbyStations_NoStations(t *testing.T) {
+ }
+ 
+ func TestGetAvailableNearbyStations_RepositoryErrorIsWrapped(t *testing.T) {
+-	got, err := NewService(&fakeRepo{err: errBoom}).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, nil)
++	got, err := NewService(&fakeRepo{err: errBoom}).GetAvailableNearbyStations(context.Background(), 0, 0, 1000, nil, 5)
+ 
+ 	if !errors.Is(err, errBoom) {
+ 		t.Fatalf("got %v, want wrapped errBoom", err)
+@@ -142,27 +77,3 @@ func TestGetAvailableNearbyStations_RepositoryErrorIsWrapped(t *testing.T) {
+ 		t.Errorf("no stations expected on error, got %d", len(got))
+ 	}
+ }
+-
+-func TestHasCommonConnector(t *testing.T) {
+-	tests := []struct {
+-		name      string
+-		preferred []string
+-		available []string
+-		want      bool
+-	}{
+-		{"match", []string{"A"}, []string{"A", "B"}, true},
+-		{"match on the second available", []string{"B"}, []string{"A", "B"}, true},
+-		{"no overlap", []string{"A"}, []string{"B"}, false},
+-		{"empty preferred", nil, []string{"A"}, false},
+-		{"empty available", []string{"A"}, nil, false},
+-		{"both empty", nil, nil, false},
+-		{"case differs", []string{"a"}, []string{"A"}, false},
+-	}
+-	for _, tc := range tests {
+-		t.Run(tc.name, func(t *testing.T) {
+-			if got := hasCommonConnector(tc.preferred, tc.available); got != tc.want {
+-				t.Errorf("got %v, want %v", got, tc.want)
+-			}
+-		})
+-	}
+-}
+diff --git a/migrations/000006_perf_indexes.down.sql b/migrations/000006_perf_indexes.down.sql
+new file mode 100644
+index 0000000..588e3cc
+--- /dev/null
++++ b/migrations/000006_perf_indexes.down.sql
+@@ -0,0 +1,3 @@
++ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
++DROP INDEX idx_route_requests_user_vehicle_id;
++DROP INDEX idx_user_vehicles_user_id;
+diff --git a/migrations/000006_perf_indexes.up.sql b/migrations/000006_perf_indexes.up.sql
+new file mode 100644
+index 0000000..8e9f326
+--- /dev/null
++++ b/migrations/000006_perf_indexes.up.sql
+@@ -0,0 +1,9 @@
++-- GET /vehicles и проверка владельца машины фильтруют по user_id: без индекса это полное сканирование user_vehicles.
++CREATE INDEX idx_user_vehicles_user_id ON user_vehicles (user_id);
++
++-- внешний ключ без индекса: каждое каскадное удаление машины сканировало бы всю историю маршрутов.
++CREATE INDEX idx_route_requests_user_vehicle_id ON route_requests (user_vehicle_id);
++
++-- users_email_lower_idx (миграция 000004) уже гарантирует уникальность без учёта регистра, а значит и точную:
++-- отдельный UNIQUE (email) только удваивает работу при каждой записи и ничего не добавляет.
++ALTER TABLE users DROP CONSTRAINT users_email_key;

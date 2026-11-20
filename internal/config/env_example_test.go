@@ -59,7 +59,7 @@ func TestEnvExample_LoadsAndMatchesDefaults(t *testing.T) {
 	wantRouting := routing.Config{
 		CriticalChargePercent: 15, MinArrivalPercent: 5, TargetChargePercent: 80,
 		SearchRadiusMeters: 5000, MaxStops: 5, MaxStationCandidates: 3,
-		LookbackStepKm: 5, MaxLookbackKm: 30,
+		LookbackStepKm: 5, MaxLookbackKm: 30, CandidateParallelism: 1,
 	}
 	if cfg.Routing != wantRouting {
 		t.Errorf("routing settings in .env.example differ from the defaults:\n got  %+v\n want %+v", cfg.Routing, wantRouting)
@@ -99,10 +99,10 @@ func TestEnvExample_DocumentsEveryVariableTheCodeReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// getEnv("X", ...), r.float("X", ...), r.int("X", ...), r.duration("X", ...)
-	re := regexp.MustCompile(`(?:getEnv|\.float|\.int|\.duration)\("([A-Z][A-Z0-9_]*)"`)
+	// getEnv("X", ...), r.float("X", ...), r.int("X", ...), r.bool("X", ...), r.duration("X", ...)
+	re := regexp.MustCompile(`(?:getEnv|\.float|\.int|\.bool|\.duration)\("([A-Z][A-Z0-9_]*)"`)
 	matches := re.FindAllStringSubmatch(string(src), -1)
-	if len(matches) < 20 {
+	if len(matches) < 30 {
 		t.Fatalf("expected to find the environment variables in config.go, found only %d (did the code style change?)", len(matches))
 	}
 

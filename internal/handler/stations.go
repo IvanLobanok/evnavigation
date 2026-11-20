@@ -21,9 +21,10 @@ const (
 )
 
 // StationFinder ищет доступные зарядные станции вокруг точки (реализует station.Service).
-// Станции приходят отсортированными по расстоянию от точки.
+// Станции приходят отсортированными по расстоянию от точки, не больше limit штук;
+// непустой preferredConnectors оставляет только станции хотя бы с одним из этих разъёмов.
 type StationFinder interface {
-	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error)
+	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string, limit int) ([]station.ChargingStation, error)
 }
 
 type StationHandler struct {
@@ -64,7 +65,8 @@ func (h *StationHandler) Nearby(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	found, err := h.finder.GetAvailableNearbyStations(r.Context(), q.lat, q.lon, q.radiusKm*1000, q.connectors)
+	// просим на одну станцию больше limit: по ней узнаём, были ли ещё станции (truncated), не загружая остальные
+	found, err := h.finder.GetAvailableNearbyStations(r.Context(), q.lat, q.lon, q.radiusKm*1000, q.connectors, q.limit+1)
 	if err != nil {
 		internalError(w, r, h.log, "find nearby stations", err)
 		return

@@ -10,6 +10,7 @@ import (
 	"github.com/IvanLobanok/evnavigation/internal/config"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
 	"github.com/IvanLobanok/evnavigation/internal/provider/cache"
+	"github.com/IvanLobanok/evnavigation/internal/provider/limit"
 	"github.com/IvanLobanok/evnavigation/internal/provider/mock"
 	"github.com/IvanLobanok/evnavigation/internal/provider/yandex"
 )
@@ -27,6 +28,42 @@ func TestNewRouteProvider_MockWithoutRedis(t *testing.T) {
 
 	if _, ok := p.(*mock.MockProvider); !ok {
 		t.Errorf("without REDIS_URL the bare mock provider is expected, got %T", p)
+	}
+}
+
+func TestNewRouteProvider_ConcurrencyLimitWrapsTheProvider(t *testing.T) {
+	cfg := testConfig()
+	cfg.RouteProviderMaxConcurrency = 4
+
+	p, closeFn, err := newRouteProvider(context.Background(), cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFn()
+
+	if _, ok := p.(*limit.Provider); !ok {
+		t.Fatalf("with ROUTE_PROVIDER_MAX_CONCURRENCY>0 the limiting decorator is expected, got %T", p)
+	}
+	segs, err := p.BuildRoute(context.Background(), route.RoutePoint{Lat: 53.9, Lon: 27.5}, route.RoutePoint{Lat: 53.8, Lon: 27.4})
+	if err != nil || len(segs) == 0 {
+		t.Errorf("routing must work through the limiter: n=%d err=%v", len(segs), err)
+	}
+}
+
+func TestNewRouteProvider_LimiterSitsUnderTheCache(t *testing.T) {
+	// кэш снаружи: попадания в кэш не должны занимать слоты, отведённые под вызовы настоящего провайдера
+	cfg := testConfig()
+	cfg.RouteProviderMaxConcurrency = 4
+	cfg.RedisURL = "redis://127.0.0.1:1/0"
+
+	p, closeFn, err := newRouteProvider(context.Background(), cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFn()
+
+	if _, ok := p.(*cache.Provider); !ok {
+		t.Errorf("the cache must be the outermost decorator, got %T", p)
 	}
 }
 

@@ -3,13 +3,14 @@ package station
 import (
 	"context"
 	"fmt"
-	"slices"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/station"
 )
 
 type Repository interface {
-	FindNearbyStations(ctx context.Context, lat, lon, radiusMeters float64) ([]station.ChargingStation, error)
+	// FindNearbyStations: работающие станции в радиусе, ближайшие первыми, не больше limit штук;
+	// непустой connectors оставляет только станции хотя бы с одним из этих разъёмов.
+	FindNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error)
 }
 
 type Service struct {
@@ -20,31 +21,13 @@ func NewService(repo Repository) *Service {
 	return &Service{repo: repo}
 }
 
-func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error) {
-	stations, err := s.repo.FindNearbyStations(ctx, lat, lon, radiusMeters)
+// GetAvailableNearbyStations возвращает до limit ближайших работающих станций с подходящими разъёмами.
+// Фильтрация и ограничение числа строк выполняются в репозитории (в SQL), а не здесь:
+// так из базы не приезжают станции, которые всё равно будут отброшены.
+func (s *Service) GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string, limit int) ([]station.ChargingStation, error) {
+	stations, err := s.repo.FindNearbyStations(ctx, lat, lon, radiusMeters, preferredConnectors, limit)
 	if err != nil {
 		return nil, fmt.Errorf("station service error: %w", err)
 	}
-
-	if len(preferredConnectors) == 0 {
-		return stations, nil
-	}
-
-	var filtered []station.ChargingStation
-	for _, st := range stations {
-		if hasCommonConnector(preferredConnectors, st.ConnectorTypes) {
-			filtered = append(filtered, st)
-		}
-	}
-	return filtered, nil
-
-}
-
-func hasCommonConnector(preferred, available []string) bool {
-	for _, v := range available {
-		if slices.Contains(preferred, v) {
-			return true
-		}
-	}
-	return false
+	return stations, nil
 }

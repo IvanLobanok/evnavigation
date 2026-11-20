@@ -18,6 +18,9 @@ type Handlers struct {
 	Routes   *RoutesHandler
 	History  *HistoryHandler
 	Tokens   TokenParser // для middleware Authenticate
+
+	// Limits - ограничения частоты запросов; нулевое значение выключает их.
+	Limits RateLimits
 }
 
 func NewRouter(h Handlers) http.Handler {
@@ -32,10 +35,13 @@ func NewRouter(h Handlers) http.Handler {
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	r.Post("/auth/register", h.Auth.Register)
-	r.Post("/auth/login", h.Auth.Login)
-	r.Get("/ev-models", h.Vehicles.ListModels)
-	r.Get("/stations/nearby", h.Stations.Nearby)
+
+	authLimit := limitByIP(h.Limits.Auth, h.Limits.TrustProxyHeaders)
+	publicLimit := limitByIP(h.Limits.Public, h.Limits.TrustProxyHeaders)
+	r.With(authLimit).Post("/auth/register", h.Auth.Register)
+	r.With(authLimit).Post("/auth/login", h.Auth.Login)
+	r.With(publicLimit).Get("/ev-models", h.Vehicles.ListModels)
+	r.With(publicLimit).Get("/stations/nearby", h.Stations.Nearby)
 
 	// эндпоинты, требующие JWT
 	r.Group(func(r chi.Router) {
@@ -45,7 +51,7 @@ func NewRouter(h Handlers) http.Handler {
 		r.Get("/vehicles", h.Vehicles.List)
 		r.Get("/vehicles/{id}", h.Vehicles.Get)
 
-		r.Post("/routes", h.Routes.PlanRoute)
+		r.With(limitByUser(h.Limits.Routes)).Post("/routes", h.Routes.PlanRoute)
 		r.Get("/routes/history", h.History.List)
 	})
 

@@ -21,11 +21,12 @@ type fakeStationFinder struct {
 
 	gotLat, gotLon, gotRadius float64
 	gotConnectors             []string
+	gotLimit                  int
 }
 
-func (f *fakeStationFinder) GetAvailableNearbyStations(_ context.Context, lat, lon, radiusMeters float64, connectors []string) ([]station.ChargingStation, error) {
+func (f *fakeStationFinder) GetAvailableNearbyStations(_ context.Context, lat, lon, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error) {
 	f.calls++
-	f.gotLat, f.gotLon, f.gotRadius, f.gotConnectors = lat, lon, radiusMeters, connectors
+	f.gotLat, f.gotLon, f.gotRadius, f.gotConnectors, f.gotLimit = lat, lon, radiusMeters, connectors, limit
 	return f.stations, f.err
 }
 
@@ -307,6 +308,30 @@ func TestDistanceMeters(t *testing.T) {
 			// расстояние симметрично
 			if back := distanceMeters(tc.lat2, tc.lon2, tc.lat1, tc.lon1); math.Abs(back-got) > 1e-6 {
 				t.Errorf("not symmetric: %v vs %v", got, back)
+			}
+		})
+	}
+}
+
+func TestNearby_AsksFinderForOneMoreThanLimit(t *testing.T) {
+	// лишняя станция нужна только для флага truncated: загружать все станции в радиусе не нужно
+	tests := []struct {
+		name      string
+		query     string
+		wantLimit int
+	}{
+		{"default limit", "lat=53.9&lon=27.5", defaultLimit + 1},
+		{"explicit limit", "lat=53.9&lon=27.5&limit=7", 8},
+		{"max limit", "lat=53.9&lon=27.5&limit=100", 101},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			finder := &fakeStationFinder{}
+			if rec := getNearby(NewStationHandler(finder, nil), tc.query); rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			if finder.gotLimit != tc.wantLimit {
+				t.Errorf("finder asked for %d stations, want %d", finder.gotLimit, tc.wantLimit)
 			}
 		})
 	}

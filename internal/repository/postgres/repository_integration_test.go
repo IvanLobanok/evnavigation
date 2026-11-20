@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
 	"github.com/IvanLobanok/evnavigation/internal/models/history"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
+	"github.com/IvanLobanok/evnavigation/internal/models/station"
 	"github.com/IvanLobanok/evnavigation/internal/models/user"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -305,7 +307,7 @@ func TestStations_FindNearby(t *testing.T) {
 	ctx := context.Background()
 	id, lat, lon := seededStation(t, pool)
 
-	found, err := r.FindNearbyStations(ctx, lat, lon, 100)
+	found, err := r.FindNearbyStations(ctx, lat, lon, 100, nil, 100)
 	if err != nil {
 		t.Fatalf("FindNearbyStations: %v", err)
 	}
@@ -331,7 +333,7 @@ func TestStations_FindNearbyIsSortedByDistance(t *testing.T) {
 	ctx := context.Background()
 	_, lat, lon := seededStation(t, pool)
 
-	found, err := r.FindNearbyStations(ctx, lat, lon, 30_000)
+	found, err := r.FindNearbyStations(ctx, lat, lon, 30_000, nil, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,14 +362,14 @@ func TestStations_RadiusIsRespected(t *testing.T) {
 	ctx := context.Background()
 
 	// (0, 0) — Гвинейский залив: станций там нет
-	if found, err := r.FindNearbyStations(ctx, 0, 0, 50_000); err != nil || len(found) != 0 {
+	if found, err := r.FindNearbyStations(ctx, 0, 0, 50_000, nil, 100); err != nil || len(found) != 0 {
 		t.Errorf("far from every station: got %d stations, err=%v", len(found), err)
 	}
 
 	// чем больше радиус, тем не меньше станций
 	_, lat, lon := seededStation(t, pool)
-	small, err1 := r.FindNearbyStations(ctx, lat, lon, 100)
-	large, err2 := r.FindNearbyStations(ctx, lat, lon, 50_000)
+	small, err1 := r.FindNearbyStations(ctx, lat, lon, 100, nil, 1000)
+	large, err2 := r.FindNearbyStations(ctx, lat, lon, 50_000, nil, 1000)
 	if err1 != nil || err2 != nil {
 		t.Fatalf("errors: %v %v", err1, err2)
 	}
@@ -391,7 +393,7 @@ func TestStations_InactiveStationsAreHidden(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM charging_stations WHERE id = $1`, inactiveID) })
 
-	found, err := r.FindNearbyStations(ctx, lat, lon, 1000)
+	found, err := r.FindNearbyStations(ctx, lat, lon, 1000, nil, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,5 +562,145 @@ func TestRouteRequests_UnknownVehicleIsRejected(t *testing.T) {
 
 	if _, err := r.CreateRouteRequest(context.Background(), sampleRouteRequest(uid, 2_000_000_000, history.StatusOK, nil)); err == nil {
 		t.Fatal("a request for a non-existent vehicle must be rejected by the foreign key")
+	}
+}
+
+// insertTestStation создаёт станцию с заданными разъёмами и удаляет её в t.Cleanup.
+func insertTestStation(t *testing.T, pool *pgxpool.Pool, lat, lon float64, connectors ...string) int64 {
+	t.Helper()
+	if connectors == nil {
+		connectors = []string{} // колонка NOT NULL: «без разъёмов» это пустой массив, а не NULL
+	}
+	var id int64
+	err := pool.QueryRow(context.Background(), `
+		INSERT INTO charging_stations (name, location, connector_types, power_kw)
+		VALUES ('integration-test station', ST_SetSRID(ST_MakePoint($1,$2),4326)::geography, $3, 50)
+		RETURNING id`, lon, lat, connectors).Scan(&id)
+	if err != nil {
+		t.Fatalf("insert station: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM charging_stations WHERE id = $1`, id) })
+	return id
+}
+
+func stationIDs(list []station.ChargingStation) []int64 {
+	out := make([]int64, 0, len(list))
+	for _, s := range list {
+		out = append(out, s.ID)
+	}
+	return out
+}
+
+// Точка (0, 0) — Гвинейский залив: сид-станций рядом нет, поэтому тесты ниже видят только свои станции.
+
+func TestStations_ConnectorFilter(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	a := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
+	b := insertTestStation(t, pool, 0, 0.0020, "it-conn-B")
+	ab := insertTestStation(t, pool, 0, 0.0030, "it-conn-A", "it-conn-B")
+	none := insertTestStation(t, pool, 0, 0.0040) // без разъёмов
+
+	tests := []struct {
+		name       string
+		connectors []string
+		want       []int64
+	}{
+		{"nil filter returns everything", nil, []int64{a, b, ab, none}},
+		{"empty filter returns everything", []string{}, []int64{a, b, ab, none}},
+		{"single connector", []string{"it-conn-A"}, []int64{a, ab}},
+		{"station with several connectors matches by any of them", []string{"it-conn-B"}, []int64{b, ab}},
+		{"several preferred connectors: any of them is enough", []string{"it-conn-A", "it-conn-B"}, []int64{a, b, ab}},
+		{"unknown connector matches nothing", []string{"it-conn-none"}, []int64{}},
+		{"matching is exact and case-sensitive", []string{"IT-CONN-A"}, []int64{}},
+		{"a station without connectors never matches a filter", []string{""}, []int64{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := r.FindNearbyStations(ctx, 0, 0, 5_000, tc.connectors, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(stationIDs(got), tc.want) {
+				t.Errorf("got %v, want %v", stationIDs(got), tc.want)
+			}
+		})
+	}
+}
+
+func TestStations_LimitKeepsTheNearest(t *testing.T) {
+	r, pool := newTestRepo(t)
+	ctx := context.Background()
+	far := insertTestStation(t, pool, 0, 0.0030, "it-conn-A")
+	near := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
+	mid := insertTestStation(t, pool, 0, 0.0020, "it-conn-A")
+
+	got, err := r.FindNearbyStations(ctx, 0, 0, 5_000, []string{"it-conn-A"}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(stationIDs(got), []int64{near, mid}) {
+		t.Errorf("limit 2 must keep the two nearest in order, got %v (far=%d)", stationIDs(got), far)
+	}
+
+	all, err := r.FindNearbyStations(ctx, 0, 0, 5_000, []string{"it-conn-A"}, 100)
+	if err != nil || !slices.Equal(stationIDs(all), []int64{near, mid, far}) {
+		t.Errorf("limit above the count returns all: got %v err=%v", stationIDs(all), err)
+	}
+}
+
+func TestStations_EqualDistanceIsOrderedByID(t *testing.T) {
+	r, pool := newTestRepo(t)
+	first := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
+	second := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
+	third := insertTestStation(t, pool, 0, 0.0010, "it-conn-A")
+
+	for i := 0; i < 5; i++ { // порядок не должен «плавать» между запросами
+		got, err := r.FindNearbyStations(context.Background(), 0, 0, 5_000, []string{"it-conn-A"}, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(stationIDs(got), []int64{first, second, third}) {
+			t.Fatalf("run %d: got %v, want ids ascending %v", i, stationIDs(got), []int64{first, second, third})
+		}
+	}
+}
+
+func TestStations_RadiusAppliesWithConnectorFilterAndLimit(t *testing.T) {
+	r, pool := newTestRepo(t)
+	inside := insertTestStation(t, pool, 0, 0.0100, "it-conn-A") // ~1.1 км
+	_ = insertTestStation(t, pool, 0, 0.1000, "it-conn-A")       // ~11 км: за пределами радиуса 5 км
+
+	got, err := r.FindNearbyStations(context.Background(), 0, 0, 5_000, []string{"it-conn-A"}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(stationIDs(got), []int64{inside}) {
+		t.Errorf("only the station inside the radius expected, got %v", stationIDs(got))
+	}
+}
+
+func TestStations_LimitMustBePositive(t *testing.T) {
+	r, _ := newTestRepo(t)
+	for _, limit := range []int{0, -1} {
+		if _, err := r.FindNearbyStations(context.Background(), 0, 0, 1000, nil, limit); err == nil {
+			t.Errorf("limit %d must be rejected", limit)
+		}
+	}
+}
+
+func TestSchema_PerformanceIndexesExist(t *testing.T) {
+	_, pool := newTestRepo(t)
+	for _, name := range []string{
+		"idx_user_vehicles_user_id",
+		"idx_route_requests_user_vehicle_id",
+		"idx_charging_stations_location",
+		"users_email_lower_idx",
+	} {
+		var exists bool
+		err := pool.QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1)`, name).Scan(&exists)
+		if err != nil || !exists {
+			t.Errorf("index %s is missing (err=%v)", name, err)
+		}
 	}
 }

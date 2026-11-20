@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"sync"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
@@ -19,8 +20,9 @@ var (
 )
 
 // StationFinder - интерфейс для поиска зарядных станций (изолирует базу данных / репозиторий).
+// Возвращает работающие станции с хотя бы одним из preferredConnectors, ближайшие первыми, не больше limit штук.
 type StationFinder interface {
-	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string) ([]station.ChargingStation, error)
+	GetAvailableNearbyStations(ctx context.Context, lat, lon, radiusMeters float64, preferredConnectors []string, limit int) ([]station.ChargingStation, error)
 }
 
 // Config содержит все константы и параметры для симуляции и построения маршрута.
@@ -33,6 +35,13 @@ type Config struct {
 	MaxStationCandidates  int     // Максимальное количество станций для одновременной проверки
 	LookbackStepKm        float64 // Шаг сканирования назад по маршруту при поиске станции
 	MaxLookbackKm         float64 // Максимальная глубина отката назад в км
+
+	// CandidateParallelism: сколько станций-кандидатов проверять одновременно (каждая проверка - вызов провайдера маршрутов).
+	// 0 и 1 - по одной, как раньше: меньше вызовов платного провайдера, но дольше ждать.
+	// Больше 1 - быстрее ответ, но кандидаты шага отката проверяются сразу все, а не до первой удачной: вызовов провайдера
+	// становится больше (часть из них отменяется, если ближайшая станция успела ответить раньше).
+	// Результат от значения не зависит: побеждает первый по порядку (ближайший) достижимый кандидат.
+	CandidateParallelism int
 }
 
 // RouteService реализует бизнес-логику построения и симуляции электромобильных маршрутов.
@@ -55,6 +64,9 @@ func NewService(routeProvider route.RouteProvider, stationFinder StationFinder, 
 	}
 	if c.MaxStops <= 0 || c.MaxStationCandidates <= 0 {
 		return nil, errors.New("max stops and candidates must be positive")
+	}
+	if c.CandidateParallelism < 0 {
+		return nil, errors.New("candidate parallelism must not be negative")
 	}
 	return &RouteService{
 		routeProvider: routeProvider,
@@ -221,6 +233,10 @@ func (s *RouteService) analyzeRoute(ctx context.Context, from, to route.RoutePoi
 	return analysis, nil
 }
 
+// straightLineSlack: нижняя оценка длины пути до станции - это 97% расстояния по прямой.
+// Дорога не бывает короче прямой, а 3% запаса прощают провайдерам и тестовым данным с чуть иным радиусом Земли.
+const straightLineSlack = 0.97
+
 // findReachableStation реализует стратегию "Lookback" (откат назад от критической точки).
 // Если впереди батарея разряжается, метод идет назад по точкам маршрута, ищет станции в радиусе
 // и проверяет физическую достижимость каждой из них с учетом минимального безопасного остатка.
@@ -247,8 +263,11 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
 		}
 		lastSearchKm = p.CumulativeDistanceKm
 
-		// Ищем доступные станции в окрестности текущей точки отката
-		found, err := s.stationFinder.GetAvailableNearbyStations(ctx, p.Point.Lat, p.Point.Lon, s.config.SearchRadiusMeters, []string{ev.ConnectorType})
+		// Ищем доступные станции в окрестности текущей точки отката. Фильтр по разъёму и ограничение числа строк
+		// выполняет база: уже опробованные станции (tried) отсеиваются здесь, поэтому просим MaxStationCandidates + len(tried) -
+		// даже если все опробованные окажутся ближе всех, свежих кандидатов хватит.
+		limit := s.config.MaxStationCandidates + len(tried)
+		found, err := s.stationFinder.GetAvailableNearbyStations(ctx, p.Point.Lat, p.Point.Lon, s.config.SearchRadiusMeters, []string{ev.ConnectorType}, limit)
 		if err != nil {
 			return station.ChargingStation{}, nil, fmt.Errorf("find stations: %w", err)
 		}
@@ -266,20 +285,17 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
 		if len(fresh) > 0 {
 			foundAny = true
 		}
-
-		// Проверяем каждого кандидата на физическую достижимость с текущим зарядом
 		for _, c := range fresh {
 			tried[c.ID] = struct{}{}
+		}
 
-			// Строим подмаршрут до станции и симулируем поездку к ней
-			leg, err := s.analyzeRoute(ctx, current, route.RoutePoint{Lat: c.Latitude, Lon: c.Longitude}, ev, charge)
-			if err != nil {
-				return station.ChargingStation{}, nil, err
-			}
-			// Если доехали и остаток заряда выше или равен минимальному порогу приезда - станция найдена!
-			if leg.last().RemainingBatteryPercent >= s.config.MinArrivalPercent {
-				return c, leg, nil
-			}
+		// Проверяем кандидатов на физическую достижимость с текущим зарядом
+		c, leg, ok, err := s.firstReachable(ctx, current, fresh, ev, charge)
+		if err != nil {
+			return station.ChargingStation{}, nil, err
+		}
+		if ok {
+			return c, leg, nil
 		}
 	}
 
@@ -288,4 +304,151 @@ func (s *RouteService) findReachableStation(ctx context.Context, current route.R
 		return station.ChargingStation{}, nil, ErrStationUnreachable // Станции есть, но до них не доехать
 	}
 	return station.ChargingStation{}, nil, ErrNoStationNearby // Вблизи критической зоны вообще нет станций
+}
+
+// candidateResult - итог проверки одного кандидата.
+type candidateResult struct {
+	leg *RouteAnalysis
+	err error
+}
+
+// firstReachable возвращает первую по порядку станцию, до которой хватает заряда, вместе с участком пути к ней.
+// ok == false без ошибки значит, что ни одна из станций недостижима.
+//
+// Сначала отсеиваются станции, до которых не доехать даже по прямой: для них не нужен вызов провайдера маршрутов.
+// Остальные проверяются по одной или параллельно (CandidateParallelism); выбор от этого не зависит.
+func (s *RouteService) firstReachable(ctx context.Context, current route.RoutePoint, candidates []station.ChargingStation, ev evmodel.EVModel, charge float64) (st station.ChargingStation, leg *RouteAnalysis, ok bool, err error) {
+	viable := make([]station.ChargingStation, 0, len(candidates))
+	for _, c := range candidates {
+		if !s.hopeless(current, route.RoutePoint{Lat: c.Latitude, Lon: c.Longitude}, ev, charge) {
+			viable = append(viable, c)
+		}
+	}
+	if len(viable) == 0 {
+		return station.ChargingStation{}, nil, false, nil
+	}
+
+	// Строим подмаршрут до станции и симулируем поездку к ней.
+	check := func(ctx context.Context, c station.ChargingStation) (*RouteAnalysis, error) {
+		return s.analyzeRoute(ctx, current, route.RoutePoint{Lat: c.Latitude, Lon: c.Longitude}, ev, charge)
+	}
+	// Если доехали и остаток заряда выше или равен минимальному порогу приезда - станция найдена!
+	reached := func(a *RouteAnalysis) bool {
+		return a.last().RemainingBatteryPercent >= s.config.MinArrivalPercent
+	}
+
+	if s.config.CandidateParallelism <= 1 || len(viable) == 1 {
+		for _, c := range viable {
+			a, err := check(ctx, c)
+			if err != nil {
+				return station.ChargingStation{}, nil, false, err
+			}
+			if reached(a) {
+				return c, a, true, nil
+			}
+		}
+		return station.ChargingStation{}, nil, false, nil
+	}
+
+	// Параллельная проверка. Каждый кандидат получает свой контекст: когда найден достижимый кандидат с индексом i,
+	// кандидаты правее него уже не могут победить, и их проверки отменяются, а кандидаты левее продолжают -
+	// среди них может найтись более близкая станция, которая должна победить, как и при последовательной проверке.
+	results := make([]candidateResult, len(viable))
+	ctxs := make([]context.Context, len(viable))
+	cancels := make([]context.CancelFunc, len(viable))
+	for i := range viable {
+		ctxs[i], cancels[i] = context.WithCancel(ctx)
+	}
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}()
+
+	var (
+		mu   sync.Mutex
+		best = len(viable) // наименьший индекс кандидата, про которого уже известно, что он достижим
+		sem  = make(chan struct{}, s.config.CandidateParallelism)
+		wg   sync.WaitGroup
+	)
+	for i := range viable {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Паника в горутине не попадает под chi Recoverer и уронила бы весь процесс, поэтому превращаем её в ошибку.
+			defer func() {
+				if r := recover(); r != nil {
+					results[i] = candidateResult{err: fmt.Errorf("check station %d: panic: %v", viable[i].ID, r)}
+				}
+			}()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			mu.Lock()
+			superseded := i > best
+			mu.Unlock()
+			if superseded || ctxs[i].Err() != nil {
+				err := ctxs[i].Err()
+				if err == nil {
+					err = context.Canceled
+				}
+				results[i] = candidateResult{err: err}
+				return
+			}
+
+			a, err := check(ctxs[i], viable[i])
+			results[i] = candidateResult{leg: a, err: err}
+			if err == nil && reached(a) {
+				mu.Lock()
+				if i < best {
+					best = i
+					for j := i + 1; j < len(viable); j++ {
+						cancels[j]()
+					}
+				}
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Читаем результаты в порядке кандидатов - ровно так же, как делала последовательная проверка.
+	// Отменённые нами кандидаты стоят правее победителя, до них дело не доходит.
+	for i, c := range viable {
+		res := results[i]
+		if res.err != nil {
+			return station.ChargingStation{}, nil, false, res.err
+		}
+		if res.leg == nil {
+			return station.ChargingStation{}, nil, false, fmt.Errorf("check station %d: no result", c.ID)
+		}
+		if reached(res.leg) {
+			return c, res.leg, true, nil
+		}
+	}
+	return station.ChargingStation{}, nil, false, nil
+}
+
+// hopeless сообщает, что до точки to заведомо не доехать с зарядом charge: даже по прямой (кратчайший из возможных путей)
+// остаток при прибытии окажется ниже MinArrivalPercent. Это отсев без обращения к провайдеру маршрутов.
+// Данные, которые не прошли бы проверку в analyzeRoute, не отсеиваются: пусть ошибку вернёт он.
+func (s *RouteService) hopeless(from, to route.RoutePoint, ev evmodel.EVModel, charge float64) bool {
+	if ev.BatteryCapacityKwh <= 0 || charge < 0 || charge > 100 {
+		return false
+	}
+	minKm := greatCircleKm(from, to) * straightLineSlack
+	minUsedPercent := (minKm / 100) * ev.AvgConsumptionKwh100km / ev.BatteryCapacityKwh * 100
+	return charge-minUsedPercent < s.config.MinArrivalPercent
+}
+
+// greatCircleKm - расстояние по большому кругу между точками (формула гаверсинусов).
+func greatCircleKm(a, b route.RoutePoint) float64 {
+	const earthRadiusKm = 6371.0
+	rad := func(d float64) float64 { return d * math.Pi / 180 }
+	dLat := rad(b.Lat - a.Lat)
+	dLon := rad(b.Lon - a.Lon)
+	h := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(rad(a.Lat))*math.Cos(rad(b.Lat))*math.Sin(dLon/2)*math.Sin(dLon/2)
+	return 2 * earthRadiusKm * math.Asin(math.Min(1, math.Sqrt(h)))
 }

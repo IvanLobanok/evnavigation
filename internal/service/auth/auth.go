@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,10 @@ const (
 var (
 	ErrInvalidCredentials = errors.New("invalid email or password")
 	ErrInvalidToken       = errors.New("invalid or expired token")
+
+	// ErrBusy: все слоты хэширования паролей заняты, а время ожидания запроса вышло.
+	// bcrypt нагружает процессор, и без ограничения число одновременных хэшей определяет любой желающий.
+	ErrBusy = errors.New("too many password hashes in progress")
 )
 
 // ValidationError описывает некорректные поля регистрации.
@@ -44,6 +49,11 @@ type Config struct {
 	Secret     []byte        // ключ подписи HS256
 	TTL        time.Duration // срок жизни access-токена
 	BcryptCost int           // 0 => bcrypt.DefaultCost
+
+	// BcryptMaxConcurrent - сколько bcrypt-операций (регистрация, логин) выполняются одновременно;
+	// остальные ждут слот, пока не истечёт контекст запроса. 0 => runtime.GOMAXPROCS(0): больше хэшей одновременно
+	// не ускоряют работу, а только отбирают процессор у остальных запросов.
+	BcryptMaxConcurrent int
 }
 
 type Service struct {
@@ -53,6 +63,8 @@ type Service struct {
 	cost      int
 	now       func() time.Time
 	dummyHash []byte // для выравнивания времени ответа, когда пользователя нет
+
+	hashSlots chan struct{} // семафор: сколько bcrypt-операций можно выполнять одновременно
 }
 
 func NewService(store UserStore, cfg Config) (*Service, error) {
@@ -70,6 +82,14 @@ func NewService(store UserStore, cfg Config) (*Service, error) {
 		return nil, fmt.Errorf("bcrypt cost must be between %d and %d", bcrypt.MinCost, bcrypt.MaxCost)
 	}
 
+	if cfg.BcryptMaxConcurrent < 0 {
+		return nil, errors.New("bcrypt max concurrency must not be negative")
+	}
+	slots := cfg.BcryptMaxConcurrent
+	if slots == 0 {
+		slots = runtime.GOMAXPROCS(0)
+	}
+
 	dummy, err := bcrypt.GenerateFromPassword([]byte("timing-equalizer"), cost)
 	if err != nil {
 		return nil, fmt.Errorf("prepare dummy hash: %w", err)
@@ -82,7 +102,21 @@ func NewService(store UserStore, cfg Config) (*Service, error) {
 		cost:      cost,
 		now:       time.Now,
 		dummyHash: dummy,
+		hashSlots: make(chan struct{}, slots),
 	}, nil
+}
+
+// withHashSlot выполняет fn (bcrypt-операцию), когда освободится слот. Пока слота нет, ждёт, но не дольше контекста
+// запроса: тогда возвращает ErrBusy, а fn не вызывается.
+func (s *Service) withHashSlot(ctx context.Context, fn func()) error {
+	select {
+	case s.hashSlots <- struct{}{}:
+	case <-ctx.Done():
+		return ErrBusy
+	}
+	defer func() { <-s.hashSlots }()
+	fn()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -103,9 +137,15 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (*user.User, e
 		return nil, &ValidationError{Fields: fields}
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), s.cost)
-	if err != nil {
-		return nil, fmt.Errorf("hash password: %w", err)
+	var (
+		hash    []byte
+		hashErr error
+	)
+	if err := s.withHashSlot(ctx, func() { hash, hashErr = bcrypt.GenerateFromPassword([]byte(in.Password), s.cost) }); err != nil {
+		return nil, err
+	}
+	if hashErr != nil {
+		return nil, fmt.Errorf("hash password: %w", hashErr)
 	}
 
 	createdAt := s.now().UTC()
@@ -165,13 +205,19 @@ func (s *Service) Login(ctx context.Context, email, password string) (*Token, er
 	if err != nil {
 		if errors.Is(err, user.ErrNotFound) {
 			// всё равно считаем bcrypt, чтобы по времени ответа нельзя было отличить «нет такого email»
-			_ = bcrypt.CompareHashAndPassword(s.dummyHash, []byte(password))
+			if err := s.withHashSlot(ctx, func() { _ = bcrypt.CompareHashAndPassword(s.dummyHash, []byte(password)) }); err != nil {
+				return nil, err
+			}
 			return nil, ErrInvalidCredentials
 		}
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+	var cmpErr error
+	if err := s.withHashSlot(ctx, func() { cmpErr = bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) }); err != nil {
+		return nil, err
+	}
+	if cmpErr != nil {
 		return nil, ErrInvalidCredentials
 	}
 

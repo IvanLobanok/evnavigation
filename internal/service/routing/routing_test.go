@@ -3,9 +3,13 @@ package routing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/IvanLobanok/evnavigation/internal/models/evmodel"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
@@ -29,15 +33,34 @@ func kmOf(p route.RoutePoint) float64 { return p.Lat * kmPerDeg }
 var errBoom = errors.New("boom")
 
 // fakeProvider строит прямой маршрут по меридиану, нарезая его на сегменты по stepKm.
+// Он потокобезопасен: при параллельной проверке кандидатов BuildRoute вызывается из нескольких горутин.
 type fakeProvider struct {
+	mu    sync.Mutex
 	calls int
 	err   error
+
+	// detour умножает длину каждого сегмента (дорога длиннее прямой); 0 означает 1, то есть без изменений.
+	detour float64
+	// onCall вызывается в начале каждого BuildRoute: может ждать (с учётом ctx), вернуть ошибку или паниковать.
+	onCall func(ctx context.Context, from, to route.RoutePoint) error
 }
 
-func (f *fakeProvider) BuildRoute(_ context.Context, from, to route.RoutePoint) ([]route.RouteSegment, error) {
+func (f *fakeProvider) BuildRoute(ctx context.Context, from, to route.RoutePoint) ([]route.RouteSegment, error) {
+	f.mu.Lock()
 	f.calls++
-	if f.err != nil {
-		return nil, f.err
+	err, detour, onCall := f.err, f.detour, f.onCall
+	f.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	if onCall != nil {
+		if err := onCall(ctx, from, to); err != nil {
+			return nil, err
+		}
+	}
+	if detour == 0 {
+		detour = 1
 	}
 	a, b := kmOf(from), kmOf(to)
 	total := math.Abs(b - a)
@@ -52,22 +75,28 @@ func (f *fakeProvider) BuildRoute(_ context.Context, from, to route.RoutePoint) 
 		segs = append(segs, route.RouteSegment{
 			From:           pt(a + dir*done),
 			To:             pt(a + dir*(done+step)),
-			DistanceMeters: step * 1000,
+			DistanceMeters: step * 1000 * detour,
 		})
 		done += step
 	}
 	return segs, nil
 }
 
-// fakeFinder ищет станции из заданного списка: по радиусу и разъёму, сортируя по расстоянию.
+// fakeFinder ищет станции из заданного списка: по радиусу и разъёму, сортируя по расстоянию и обрезая по limit
+// (как настоящий репозиторий, у которого фильтр и LIMIT выполняются в SQL).
 type fakeFinder struct {
 	stations []station.ChargingStation
 	calls    int
 	err      error
+
+	gotConnectors [][]string // разъёмы каждого вызова
+	gotLimits     []int      // limit каждого вызова
 }
 
-func (f *fakeFinder) GetAvailableNearbyStations(_ context.Context, lat, _, radiusMeters float64, connectors []string) ([]station.ChargingStation, error) {
+func (f *fakeFinder) GetAvailableNearbyStations(_ context.Context, lat, _, radiusMeters float64, connectors []string, limit int) ([]station.ChargingStation, error) {
 	f.calls++
+	f.gotConnectors = append(f.gotConnectors, connectors)
+	f.gotLimits = append(f.gotLimits, limit)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -86,6 +115,9 @@ func (f *fakeFinder) GetAvailableNearbyStations(_ context.Context, lat, _, radiu
 		items = append(items, item{st, d})
 	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].dist < items[j].dist })
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
 
 	out := make([]station.ChargingStation, 0, len(items))
 	for _, it := range items {
@@ -359,39 +391,48 @@ func TestPlanRoute(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := testConfig()
-			if tc.cfg != nil {
-				tc.cfg(&cfg)
-			}
-			svc, _, _ := newTestService(t, cfg, tc.stations...)
+	// Результат не должен зависеть от того, проверяются кандидаты по одному или параллельно.
+	for _, parallelism := range []int{0, 1, 3} {
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("parallelism=%d/%s", parallelism, tc.name), func(t *testing.T) {
+				runPlanRouteCase(t, parallelism, tc.cfg, tc.stations, tc.startPct, tc.finishKm, tc.wantErr, tc.wantStopIDs, tc.wantLegs)
+			})
+		}
+	}
+}
 
-			plan, err := svc.PlanRoute(context.Background(), pt(0), pt(tc.finishKm), testEV, tc.startPct)
+func runPlanRouteCase(t *testing.T, parallelism int, mutate func(*Config), stations []station.ChargingStation, startPct, finishKm float64, wantErr error, wantStopIDs []int64, wantLegs int) {
+	t.Helper()
+	cfg := testConfig()
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	cfg.CandidateParallelism = parallelism
+	svc, _, _ := newTestService(t, cfg, stations...)
 
-			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("error: got %v, want %v", err, tc.wantErr)
-			}
-			if plan == nil {
-				t.Fatal("plan must not be nil (partial plan is returned together with route errors)")
-			}
-			if len(plan.Legs) != tc.wantLegs {
-				t.Errorf("legs: got %d, want %d", len(plan.Legs), tc.wantLegs)
-			}
+	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(finishKm), testEV, startPct)
 
-			var gotIDs []int64
-			for _, s := range plan.Stops {
-				gotIDs = append(gotIDs, s.Station.ID)
-			}
-			if len(gotIDs) != len(tc.wantStopIDs) {
-				t.Fatalf("stops: got %v, want %v", gotIDs, tc.wantStopIDs)
-			}
-			for i := range gotIDs {
-				if gotIDs[i] != tc.wantStopIDs[i] {
-					t.Errorf("stop %d: got station %d, want %d", i, gotIDs[i], tc.wantStopIDs[i])
-				}
-			}
-		})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error: got %v, want %v", err, wantErr)
+	}
+	if plan == nil {
+		t.Fatal("plan must not be nil (partial plan is returned together with route errors)")
+	}
+	if len(plan.Legs) != wantLegs {
+		t.Errorf("legs: got %d, want %d", len(plan.Legs), wantLegs)
+	}
+
+	var gotIDs []int64
+	for _, s := range plan.Stops {
+		gotIDs = append(gotIDs, s.Station.ID)
+	}
+	if len(gotIDs) != len(wantStopIDs) {
+		t.Fatalf("stops: got %v, want %v", gotIDs, wantStopIDs)
+	}
+	for i := range gotIDs {
+		if gotIDs[i] != wantStopIDs[i] {
+			t.Errorf("stop %d: got station %d, want %d", i, gotIDs[i], wantStopIDs[i])
+		}
 	}
 }
 
@@ -426,7 +467,8 @@ func TestPlanRoute_OneStopDetails(t *testing.T) {
 func TestPlanRoute_UnreachableStationIsCheckedOnlyOnce(t *testing.T) {
 	cfg := testConfig()
 	cfg.SearchRadiusMeters = 70000 // круги поиска в разных точках отката сильно перекрываются
-	svc, prov, _ := newTestService(t, cfg, stn(1, 290))
+	svc, prov, _ := newTestService(t, cfg, stn(1, 250))
+	prov.detour = 1.2 // по прямой станция достижима (250 км < 275 км), но дорога на 20% длиннее, и заряда не хватает
 
 	_, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
 	if !errors.Is(err, ErrStationUnreachable) {
@@ -436,6 +478,273 @@ func TestPlanRoute_UnreachableStationIsCheckedOnlyOnce(t *testing.T) {
 	// Повторные находки той же станции при откате не должны порождать новых запросов.
 	if prov.calls != 2 {
 		t.Errorf("provider calls: got %d, want 2", prov.calls)
+	}
+}
+
+func TestPlanRoute_HopelessStationDoesNotCostAProviderCall(t *testing.T) {
+	cfg := testConfig()
+	cfg.SearchRadiusMeters = 70000
+	// станция на 290-м км: 60% заряда хватает на 275 км, а прямой путь до неё уже длиннее - провайдер спрашивать незачем
+	svc, prov, _ := newTestService(t, cfg, stn(1, 290))
+
+	_, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+	if !errors.Is(err, ErrStationUnreachable) {
+		t.Fatalf("got %v, want ErrStationUnreachable (stations exist, but out of range)", err)
+	}
+	if prov.calls != 1 {
+		t.Errorf("provider calls: got %d, want 1 (only the whole-route analysis)", prov.calls)
+	}
+}
+
+func TestPlanRoute_PrefilterNeverRejectsAReachableStation(t *testing.T) {
+	// станция у самой границы достижимости по прямой: 60% - 5% = 55% = 275 км; станция на 270-м км достижима
+	cfg := testConfig()
+	cfg.SearchRadiusMeters = 70000
+	svc, _, _ := newTestService(t, cfg, stn(1, 270))
+
+	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+	if err != nil {
+		t.Fatalf("a reachable station must be found, got %v", err)
+	}
+	if len(plan.Stops) == 0 || plan.Stops[0].Station.ID != 1 {
+		t.Errorf("want a stop at station 1, got %+v", plan.Stops)
+	}
+}
+
+func TestPlanRoute_AsksFinderForConnectorAndEnoughRows(t *testing.T) {
+	cfg := testConfig()
+	cfg.SearchRadiusMeters = 70000
+	svc, _, f := newTestService(t, cfg, stn(1, 100), stn(2, 120), stn(3, 140))
+
+	if _, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60); err != nil && !errors.Is(err, ErrStationUnreachable) {
+		t.Fatal(err)
+	}
+	if f.calls == 0 {
+		t.Fatal("station finder was not called")
+	}
+	for i, got := range f.gotConnectors {
+		if len(got) != 1 || got[0] != testEV.ConnectorType {
+			t.Errorf("call %d: connectors %v, want [%s]: фильтр по разъёму должен уйти в базу", i, got, testEV.ConnectorType)
+		}
+	}
+	// limit = MaxStationCandidates + число уже опробованных станций: растёт вместе с откатом и не меньше MaxStationCandidates
+	for i, got := range f.gotLimits {
+		if got < cfg.MaxStationCandidates {
+			t.Errorf("call %d: limit %d is below MaxStationCandidates %d", i, got, cfg.MaxStationCandidates)
+		}
+	}
+	if f.gotLimits[0] != cfg.MaxStationCandidates {
+		t.Errorf("first call: limit %d, want %d (nothing has been tried yet)", f.gotLimits[0], cfg.MaxStationCandidates)
+	}
+}
+
+func TestPlanRoute_TriedStationsDoNotStarveNewCandidates(t *testing.T) {
+	// Много близких станций, до которых не доехать. Ближайшие к точке отката уже опробованы, но из-за запаса в limit
+	// (MaxStationCandidates + число опробованных) новые кандидаты всё равно доходят до проверки.
+	cfg := testConfig()
+	cfg.SearchRadiusMeters = 70000
+	cfg.MaxStationCandidates = 2
+	stations := []station.ChargingStation{stn(1, 285), stn(2, 286), stn(3, 287), stn(4, 288), stn(5, 225)}
+	svc, _, _ := newTestService(t, cfg, stations...)
+
+	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+	if err != nil {
+		t.Fatalf("station 5 is reachable and must be found despite the nearer unreachable ones: %v", err)
+	}
+	if plan.Stops[0].Station.ID != 5 {
+		t.Errorf("got station %d, want 5", plan.Stops[0].Station.ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Параллельная проверка кандидатов
+// ---------------------------------------------------------------------------
+
+func parallelConfig(parallelism int) Config {
+	cfg := testConfig()
+	cfg.SearchRadiusMeters = 70000
+	cfg.CandidateParallelism = parallelism
+	return cfg
+}
+
+// slowFor задерживает построение маршрутов до станции на заданной широте.
+func slowFor(slowKm float64, d time.Duration) func(context.Context, route.RoutePoint, route.RoutePoint) error {
+	return func(ctx context.Context, _, to route.RoutePoint) error {
+		if math.Abs(kmOf(to)-slowKm) > 1e-6 {
+			return nil
+		}
+		select {
+		case <-time.After(d):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func TestPlanRoute_ParallelPicksNearestReachableEvenIfLaterOneAnswersFirst(t *testing.T) {
+	// Первая точка поиска - критическая, 230-й км; станции идут от ближайшей к ней: 1 (229 км), затем 2 (228 км).
+	// Обе достижимы. Ответ о станции 1 приходит позже, чем о станции 2, но победить должна первая по порядку,
+	// как и при последовательной проверке.
+	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228))
+	prov.onCall = slowFor(229, 80*time.Millisecond)
+
+	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.Stops[0].Station.ID; got != 1 {
+		t.Errorf("got station %d, want 1 (the nearer one wins regardless of response order)", got)
+	}
+}
+
+func TestPlanRoute_ParallelSameChoiceAsSequential(t *testing.T) {
+	stations := []station.ChargingStation{stn(1, 225), stn(2, 226), stn(3, 227), stn(4, 228)}
+	var chosen []int64
+	for _, par := range []int{1, 4} {
+		svc, _, _ := newTestService(t, parallelConfig(par), stations...)
+		plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chosen = append(chosen, plan.Stops[0].Station.ID)
+	}
+	if chosen[0] != chosen[1] {
+		t.Errorf("sequential chose %d, parallel chose %d", chosen[0], chosen[1])
+	}
+}
+
+func TestPlanRoute_ParallelChecksCandidatesConcurrently(t *testing.T) {
+	// Все три кандидата должны оказаться «в полёте» одновременно: каждый вызов провайдера ждёт, пока начнут остальные.
+	// При последовательной проверке такой барьер никогда бы не открылся.
+	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228), stn(3, 227))
+
+	var started sync.WaitGroup
+	started.Add(3)
+	allStarted := make(chan struct{})
+	go func() { started.Wait(); close(allStarted) }()
+
+	prov.onCall = func(_ context.Context, _, to route.RoutePoint) error {
+		if kmOf(to) > 229.5 { // общий анализ маршрута и участок после станции проходят без ожидания
+			return nil
+		}
+		started.Done()
+		select {
+		case <-allStarted:
+			return nil
+		case <-time.After(2 * time.Second):
+			return errors.New("candidates were not checked concurrently")
+		}
+	}
+
+	plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Stops[0].Station.ID != 1 {
+		t.Errorf("got station %d, want 1", plan.Stops[0].Station.ID)
+	}
+}
+
+func TestPlanRoute_ParallelismIsBounded(t *testing.T) {
+	var mu sync.Mutex
+	running, peak := 0, 0
+	svc, prov, _ := newTestService(t, func() Config { c := parallelConfig(2); c.MaxStationCandidates = 5; return c }(),
+		stn(1, 221), stn(2, 222), stn(3, 223), stn(4, 224), stn(5, 225))
+	prov.onCall = func(ctx context.Context, _, to route.RoutePoint) error {
+		if kmOf(to) > 226 { // общий анализ маршрута не считаем
+			return nil
+		}
+		mu.Lock()
+		running++
+		peak = max(peak, running)
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		running--
+		mu.Unlock()
+		return nil
+	}
+
+	if _, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60); err != nil {
+		t.Fatal(err)
+	}
+	if peak > 2 {
+		t.Errorf("up to %d checks ran at once, limit is 2", peak)
+	}
+}
+
+func TestPlanRoute_ParallelProviderErrorIsReturned(t *testing.T) {
+	// порядок кандидатов от критической точки (230-й км): станция 1 (229 км), 2 (228 км), 3 (227 км); все достижимы
+	failAt := func(km float64) func(context.Context, route.RoutePoint, route.RoutePoint) error {
+		return func(_ context.Context, _, to route.RoutePoint) error {
+			if math.Abs(kmOf(to)-km) < 1e-6 {
+				return errBoom
+			}
+			return nil
+		}
+	}
+
+	t.Run("failure to the right of the winner does not matter", func(t *testing.T) {
+		svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228), stn(3, 227))
+		prov.onCall = failAt(228) // станция 2; победитель - станция 1, как при последовательной проверке
+
+		plan, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+		if err != nil {
+			t.Fatalf("got %v", err)
+		}
+		if plan.Stops[0].Station.ID != 1 {
+			t.Errorf("got station %d, want 1", plan.Stops[0].Station.ID)
+		}
+	})
+
+	t.Run("failure to the left of the winner is returned", func(t *testing.T) {
+		svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228), stn(3, 227))
+		prov.onCall = failAt(229) // станция 1 идёт первой: последовательная проверка тоже споткнулась бы на ней
+
+		if _, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60); !errors.Is(err, errBoom) {
+			t.Errorf("got %v, want errBoom", err)
+		}
+	})
+}
+
+func TestPlanRoute_ParallelPanicBecomesError(t *testing.T) {
+	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 229), stn(2, 228))
+	prov.onCall = func(_ context.Context, _, to route.RoutePoint) error {
+		if math.Abs(kmOf(to)-229) < 1e-6 {
+			panic("provider bug")
+		}
+		return nil
+	}
+
+	_, err := svc.PlanRoute(context.Background(), pt(0), pt(400), testEV, 60)
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("a panic inside a worker must come back as an error (not crash the process), got %v", err)
+	}
+}
+
+func TestPlanRoute_ParallelStopsWhenContextIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	svc, prov, _ := newTestService(t, parallelConfig(3), stn(1, 225), stn(2, 226), stn(3, 227))
+	prov.onCall = func(ctx context.Context, _, to route.RoutePoint) error {
+		if kmOf(to) > 228 { // общий анализ маршрута проходит сразу
+			return nil
+		}
+		cancel()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	done := make(chan error, 1)
+	go func() { _, err := svc.PlanRoute(ctx, pt(0), pt(400), testEV, 60); done <- err }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("PlanRoute did not return after the context was cancelled (leaked workers?)")
 	}
 }
 

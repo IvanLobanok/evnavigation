@@ -68,6 +68,8 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 			writeValidationError(w, ve.Fields)
 		case errors.Is(err, user.ErrEmailTaken):
 			writeError(w, http.StatusConflict, "email_taken", "a user with this email already exists")
+		case errors.Is(err, auth.ErrBusy):
+			serviceBusy(w)
 		default:
 			internalError(w, r, h.log, "register", err)
 		}
@@ -102,6 +104,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
 			return
 		}
+		if errors.Is(err, auth.ErrBusy) {
+			serviceBusy(w)
+			return
+		}
 		internalError(w, r, h.log, "login", err)
 		return
 	}
@@ -111,4 +117,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		TokenType:   "Bearer",
 		ExpiresIn:   int(tok.ExpiresIn.Seconds()),
 	})
+}
+
+// serviceBusy отвечает 503: сервер перегружен, повторить запрос можно чуть позже.
+func serviceBusy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	writeError(w, http.StatusServiceUnavailable, "service_busy", "the server is busy, retry shortly")
 }

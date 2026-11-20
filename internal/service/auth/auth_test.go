@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -86,6 +87,8 @@ func TestNewService_ConfigValidation(t *testing.T) {
 		{"negative ttl", Config{Secret: testSecret, TTL: -time.Second}, true},
 		{"cost too low", Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MinCost - 1}, true},
 		{"cost too high", Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MaxCost + 1}, true},
+		{"explicit hash concurrency", Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MinCost, BcryptMaxConcurrent: 2}, false},
+		{"negative hash concurrency", Config{Secret: testSecret, TTL: time.Hour, BcryptMaxConcurrent: -1}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -424,5 +427,116 @@ func TestParseToken_ExpiryBoundary(t *testing.T) {
 	svc.now = func() time.Time { return fixedNow.Add(time.Hour + time.Second) }
 	if _, err := svc.ParseToken(token); !errors.Is(err, ErrInvalidToken) {
 		t.Errorf("token must be rejected after exp, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ограничение числа одновременных bcrypt-операций
+// ---------------------------------------------------------------------------
+
+func newLimitedService(t *testing.T, store *memStore, slots int) *Service {
+	t.Helper()
+	svc, err := NewService(store, Config{Secret: testSecret, TTL: time.Hour, BcryptCost: bcrypt.MinCost, BcryptMaxConcurrent: slots})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return svc
+}
+
+func TestHashSlots_DefaultIsPositive(t *testing.T) {
+	svc := newTestService(t, newMemStore())
+	if cap(svc.hashSlots) < 1 {
+		t.Errorf("default number of hash slots must be at least 1, got %d", cap(svc.hashSlots))
+	}
+}
+
+func TestWithHashSlot_LimitsConcurrency(t *testing.T) {
+	svc := newLimitedService(t, newMemStore(), 2)
+
+	var mu sync.Mutex
+	running, peak := 0, 0
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := svc.withHashSlot(context.Background(), func() {
+				mu.Lock()
+				running++
+				peak = max(peak, running)
+				mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+				mu.Lock()
+				running--
+				mu.Unlock()
+			})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if peak > 2 {
+		t.Errorf("up to %d operations ran at once, limit is 2", peak)
+	}
+	if peak < 2 {
+		t.Errorf("the limit must allow full use of the slots: peak was %d", peak)
+	}
+}
+
+func TestWithHashSlot_ReleasesTheSlotEvenAfterPanic(t *testing.T) {
+	svc := newLimitedService(t, newMemStore(), 1)
+
+	func() {
+		defer func() { _ = recover() }()
+		_ = svc.withHashSlot(context.Background(), func() { panic("boom") })
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := svc.withHashSlot(ctx, func() {}); err != nil {
+		t.Errorf("the slot was not released after a panic: %v", err)
+	}
+}
+
+func TestLoginAndRegister_ReturnBusyWhenNoSlotIsFreeInTime(t *testing.T) {
+	store := newMemStore()
+	svc := newLimitedService(t, store, 1)
+	if _, err := svc.Register(context.Background(), RegisterInput{Name: "Ann", Email: "ann@example.com", Password: "correct horse"}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.hashSlots <- struct{}{} // единственный слот занят «чужим» хэшем
+
+	short := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 30*time.Millisecond)
+	}
+
+	ctx, cancel := short()
+	if _, err := svc.Login(ctx, "ann@example.com", "correct horse"); !errors.Is(err, ErrBusy) {
+		t.Errorf("login with a known user: got %v, want ErrBusy", err)
+	}
+	cancel()
+
+	ctx, cancel = short()
+	if _, err := svc.Login(ctx, "nobody@example.com", "whatever12"); !errors.Is(err, ErrBusy) {
+		t.Errorf("login with an unknown user must also wait for a slot (timing equalizer): got %v, want ErrBusy", err)
+	}
+	cancel()
+
+	before := store.createCalls
+	ctx, cancel = short()
+	if _, err := svc.Register(ctx, RegisterInput{Name: "Bob", Email: "bob@example.com", Password: "correct horse"}); !errors.Is(err, ErrBusy) {
+		t.Errorf("register: got %v, want ErrBusy", err)
+	}
+	cancel()
+	if store.createCalls != before {
+		t.Error("a busy registration must not reach the store")
+	}
+
+	<-svc.hashSlots // слот освободился: всё снова работает
+	if _, err := svc.Login(context.Background(), "ann@example.com", "correct horse"); err != nil {
+		t.Errorf("login after the slot was freed: %v", err)
 	}
 }

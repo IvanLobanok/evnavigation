@@ -1,0 +1,1 @@
+CREATE INDEX idx_user_vehicles_user_id ON user_vehicles (user_id);

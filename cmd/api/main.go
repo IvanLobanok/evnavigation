@@ -33,11 +33,19 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("failed to parse database url: %v", err)
+	}
+	if cfg.DBMaxConns > 0 {
+		poolCfg.MaxConns = int32(cfg.DBMaxConns)
+	}
+	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		log.Fatalf("failed to create database pool: %v", err)
 	}
 	defer dbPool.Close()
+	log.Printf("database pool: up to %d connections", poolCfg.MaxConns)
 
 	if err := dbPool.Ping(ctx); err != nil {
 		log.Fatalf("failed to ping database: %v", err)
@@ -57,8 +65,9 @@ func main() {
 	historyService := historysvc.NewService(repo)
 
 	authService, err := auth.NewService(repo, auth.Config{
-		Secret: []byte(cfg.JWTSecret),
-		TTL:    cfg.JWTTTL,
+		Secret:              []byte(cfg.JWTSecret),
+		TTL:                 cfg.JWTTTL,
+		BcryptMaxConcurrent: cfg.BcryptMaxConcurrency,
 	})
 	if err != nil {
 		log.Fatalf("failed to create auth service: %v", err)
@@ -86,6 +95,12 @@ func main() {
 		Routes:   handler.NewRoutesHandler(routingService, vehicleService, historyService, logger),
 		History:  handler.NewHistoryHandler(historyService, logger),
 		Tokens:   authService,
+		Limits: handler.RateLimits{
+			Auth:              handler.RateLimit{PerMinute: cfg.RateLimitAuthPerMin, Burst: cfg.RateLimitAuthBurst},
+			Public:            handler.RateLimit{PerMinute: cfg.RateLimitPublicPerMin, Burst: cfg.RateLimitPublicBurst},
+			Routes:            handler.RateLimit{PerMinute: cfg.RateLimitRoutesPerMin, Burst: cfg.RateLimitRoutesBurst},
+			TrustProxyHeaders: cfg.TrustProxyHeaders,
+		},
 	})
 
 	srv := &http.Server{

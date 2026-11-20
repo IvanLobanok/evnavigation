@@ -9,6 +9,7 @@ import (
 	"github.com/IvanLobanok/evnavigation/internal/config"
 	"github.com/IvanLobanok/evnavigation/internal/models/route"
 	"github.com/IvanLobanok/evnavigation/internal/provider/cache"
+	"github.com/IvanLobanok/evnavigation/internal/provider/limit"
 	"github.com/IvanLobanok/evnavigation/internal/provider/mock"
 	"github.com/IvanLobanok/evnavigation/internal/provider/yandex"
 )
@@ -29,6 +30,10 @@ func newRouteProvider(ctx context.Context, cfg *config.Config, logger *slog.Logg
 	default:
 		return nil, nil, fmt.Errorf("unknown route provider %q", cfg.RouteProvider)
 	}
+
+	// Потолок на одновременные вызовы провайдера стоит под кэшем: попадания в кэш слотов не занимают,
+	// а параллельные одинаковые запросы кэш уже схлопнул (singleflight).
+	base = limit.New(base, cfg.RouteProviderMaxConcurrency)
 
 	if cfg.RedisURL == "" {
 		logger.Info("route cache is disabled (REDIS_URL is empty)", "provider", cfg.RouteProvider)
